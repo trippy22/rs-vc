@@ -1,0 +1,21 @@
+.gradle/
+.gradle-user/
+build/
+out/
+*.class
+*.tmp
+.tools/
+.idea/
+*.iml
+node_modules/
+/relay/
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+*.log
+# Local reference trees, not plugin sources or distribution contents.
+/concentus/
+/concentus-master/
+/realtime-examples/
+/plugin-hub-tooling/

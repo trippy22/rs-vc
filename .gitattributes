@@ -1,0 +1,8 @@
+* text=auto
+gradlew text eol=lf
+gradlew.bat text eol=crlf
+# These files have byte-for-byte hashes in the codec provenance manifest.
+src/main/java/org/concentus/*.java -text
+third_party/concentus/LICENSE -text
+src/main/resources/META-INF/CONCENTUS-LICENSE.txt -text
+src/main/resources/META-INF/CONCENTUS-NOTICES.txt -text
