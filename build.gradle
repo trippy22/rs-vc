@@ -1,12 +1,22 @@
-plugins { id 'java' }
+plugins {
+    id 'java'
+}
 
 repositories {
-    maven { url = 'https://repo.runelite.net'; content { includeGroupByRegex('net\\.runelite.*') } }
+    maven {
+        url = 'https://repo.runelite.net'
+        content {
+            includeGroupByRegex('net\\.runelite.*')
+        }
+    }
     mavenCentral()
 }
 
 def runeLiteVersion = 'latest.release'
 dependencies {
+    implementation('io.github.jaredmdobson:concentus:1.0.2') {
+        transitive = false
+    }
     compileOnly "net.runelite:client:${runeLiteVersion}"
     testImplementation "net.runelite:client:${runeLiteVersion}"
     testImplementation 'junit:junit:4.13.2'
@@ -14,47 +24,62 @@ dependencies {
 
 group = 'com.rsvc'
 version = '0.1.0'
-tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8'; options.release.set(11) }
-test { useJUnit() }
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release.set(11)
+}
 
-// Build-time integrity check only; no file IO is introduced into the plugin.
-tasks.register('verifyVendoredCodec') {
-    inputs.file('third_party/concentus/provenance.json')
-    inputs.dir('src/main/java/org/concentus')
-    inputs.files('third_party/concentus/LICENSE', 'src/main/resources/META-INF/CONCENTUS-LICENSE.txt',
-        'src/main/resources/META-INF/CONCENTUS-NOTICES.txt')
+test {
+    useJUnit()
+}
+
+// Exact artifact approved by the user. Verification is build-time only.
+tasks.register('verifyConcentus') {
+    inputs.files(configurations.runtimeClasspath)
     doLast {
-        def manifest = new groovy.json.JsonSlurper().parse(file('third_party/concentus/provenance.json'))
-        def digest = { File source -> java.security.MessageDigest.getInstance('SHA-256').digest(source.bytes).encodeHex().toString() }
-        def actual = fileTree('src/main/java/org/concentus').matching { include '*.java' }.files.collect { it.name }.toSet()
-        if (actual != manifest.Files.collect { it.File }.toSet()) throw new GradleException('Vendored codec file list differs from provenance')
-        manifest.Files.each { entry ->
-            if (!digest(file("src/main/java/org/concentus/${entry.File}")).equalsIgnoreCase(entry.VendoredSha256))
-                throw new GradleException("Vendored codec hash mismatch: ${entry.File}")
+        def codec = configurations.runtimeClasspath.files.findAll { it.name == 'concentus-1.0.2.jar' }
+        if (codec.size() != 1) {
+            throw new GradleException('Expected exactly Concentus 1.0.2')
         }
-        ['third_party/concentus/LICENSE', 'src/main/resources/META-INF/CONCENTUS-LICENSE.txt'].each { path ->
-            if (!digest(file(path)).equalsIgnoreCase(manifest.LicenseSha256)) throw new GradleException("Codec license changed: ${path}")
+        def digest = java.security.MessageDigest.getInstance('SHA-256')
+            .digest(codec.first().bytes).encodeHex().toString()
+        if (digest != '3584da8a1ac7e0814a03ce3c1b1e70250bf7b07668bc39eea1048796d6471ce3') {
+            throw new GradleException('Concentus differs from the approved artifact; do not bypass verification')
         }
-        if (!digest(file('src/main/resources/META-INF/CONCENTUS-NOTICES.txt')).equalsIgnoreCase(manifest.NoticesSha256))
-            throw new GradleException('Codec notices changed')
     }
 }
-tasks.named('compileJava') { dependsOn 'verifyVendoredCodec' }
+tasks.named('compileJava') {
+    dependsOn 'verifyConcentus'
+}
+
 tasks.register('run', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.rsvc.RsVcPluginTest'
     jvmArgs '-ea'
     args '--developer-mode'
 }
-tasks.register('wireTest', JavaExec) {
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.rsvc.WireIntegration'
-    args providers.gradleProperty('relayUrl').getOrElse('ws://127.0.0.1:8787/v1/voice')
-}
 
-tasks.register('panelPreview', JavaExec) {
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.rsvc.VoicePanelPreview'
-    jvmArgs '-Djava.awt.headless=true'
-    args layout.buildDirectory.file('panel-preview.png').get().asFile.absolutePath
+// Guard the release boundary even when optional local tooling is present.
+tasks.register('verifyReleaseJar') {
+    dependsOn tasks.named('jar')
+    doLast {
+        new java.util.zip.ZipFile(tasks.named('jar').get().archiveFile.get().asFile).withCloseable { archive ->
+            def forbidden = archive.entries().findAll { entry ->
+                entry.name.startsWith('com/rsvc/dev/') ||
+                    entry.name.startsWith('com/rsvc/diagnostics/') ||
+                    entry.name.contains('MicRecording') || entry.name.contains('MicrophoneTest') ||
+                    entry.name.contains('VoiceDiagnostics') || entry.name.contains('VoiceMetrics')
+            }
+            if (!forbidden.isEmpty()) {
+                throw new GradleException("Development/recording code in release JAR: ${forbidden}")
+            }
+        }
+    }
+}
+tasks.named('check') {
+    dependsOn 'verifyReleaseJar'
+}
+// Optional local tooling. A clean checkout builds and tests without this ignored directory.
+if (!providers.gradleProperty('rsvcMinimal').isPresent() && file('dev/dev.gradle').isFile()) {
+    apply from: 'dev/dev.gradle'
 }

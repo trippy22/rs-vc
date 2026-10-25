@@ -2,26 +2,29 @@ package com.rsvc;
 
 import com.google.gson.Gson;
 import com.google.inject.Provides;
-import java.awt.Color;
-import java.awt.Graphics2D;
-import java.awt.event.KeyEvent;
-import java.awt.image.BufferedImage;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.Set;
-import javax.inject.Inject;
-import javax.swing.SwingUtilities;
+import com.rsvc.audio.AudioEngine;
+import com.rsvc.network.DisconnectReason;
+import com.rsvc.network.ReconnectPolicy;
+import com.rsvc.network.VoiceConnection;
+import com.rsvc.proximity.ProximityMatcher;
+import com.rsvc.proximity.VoiceAlias;
+import com.rsvc.proximity.VoiceIdentity;
+import com.rsvc.ui.AudioDevicePicker;
+import com.rsvc.ui.CaptureFocus;
+import com.rsvc.ui.SpeakingOverlay;
+import com.rsvc.ui.VoicePanel;
+
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
-import net.runelite.api.Ignore;
 import net.runelite.api.Player;
+import net.runelite.api.WorldView;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.FocusChanged;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
+import net.runelite.api.events.PlayerDespawned;
+import net.runelite.api.events.PlayerSpawned;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -32,11 +35,34 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
+
 import okhttp3.OkHttpClient;
 
-@PluginDescriptor(name = "RS Voice Chat", internalName = "rs-vc", description = "Private channel voice while logged in", tags = {"voice", "channel", "audio"}, enabledByDefault = false)
-public class RsVcPlugin extends Plugin implements KeyListener
-{
+import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.event.KeyEvent;
+import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.BooleanSupplier;
+
+import javax.inject.Inject;
+import javax.swing.SwingUtilities;
+
+/** RuneLite lifecycle and game-thread coordination for voice, audio devices and the sidebar. */
+@PluginDescriptor(
+        name = "RS Voice Chat",
+        internalName = "rs-vc",
+        description = "Opt-in proximity voice within 20 tiles",
+        tags = {"voice", "proximity", "audio"},
+        enabledByDefault = false)
+public class RsVcPlugin extends Plugin implements KeyListener {
     @Inject private Client client;
     @Inject private ClientThread clientThread;
     @Inject private RsVcConfig config;
@@ -44,10 +70,20 @@ public class RsVcPlugin extends Plugin implements KeyListener
     @Inject private OkHttpClient http;
     @Inject private KeyManager keyManager;
     @Inject private ClientToolbar toolbar;
+    @Inject private ConfigManager configManager;
+    @Inject private OverlayManager overlayManager;
 
     private VoicePanel panel;
-    private VoiceDiagnostics diagnostics;
+    private VoiceObserver observer = VoiceObserver.NONE;
+    private Runnable localTestCleanup;
+    private BooleanSupplier localTestSpeaking;
+    private SpeakingOverlay speakingOverlay;
+    private volatile List<Player> speakingPlayers = Collections.emptyList();
+    private final Map<Long, Player> matchedPlayers = new HashMap<>();
+    private long nextSpeakingUpdate;
+    private AudioDevicePicker devicePicker;
     private NavigationButton navigation;
+    // These references/flags are also read by WebSocket and audio callbacks.
     private volatile VoiceConnection connection;
     private volatile AudioEngine audio;
     private volatile boolean muted;
@@ -57,200 +93,875 @@ public class RsVcPlugin extends Plugin implements KeyListener
     private volatile boolean eligible;
     private volatile long eligibleAt;
     private volatile boolean started;
-    private final Set<Long> blocked = new HashSet<>(); // Client-thread owned.
-    private Set<String> ignored = Collections.emptySet();
+    private volatile boolean focused;
+    private volatile CaptureFocus captureFocus;
+    // Game-thread-owned collections; workers receive copies rather than game objects.
+    private final Set<Long> blocked = new HashSet<>();
     private final Set<String> mutedNames = new HashSet<>();
+    private final Map<String, Integer> speakerVolumes = new HashMap<>();
     private List<VoiceConnection.Peer> peers = Collections.emptyList();
-    private final Map<Long, String> knownPeers = new LinkedHashMap<>();
     private final ReconnectPolicy reconnect = new ReconnectPolicy();
     private long retryAt;
-    private String sessionKey = "";
-    private String sessionChannel = "";
+    // Client-thread intent: explicit Disconnect stays off until Connect or plugin re-enable.
+    private boolean connectionWanted;
     private String sessionName = "";
+    private volatile String sessionRoom = "";
+    private final Set<Player> visiblePlayers =
+            Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    private final ProximityMatcher matcher = new ProximityMatcher();
+    private WorldView trackedView;
 
-    @Provides RsVcConfig provideConfig(ConfigManager manager) { return manager.getConfig(RsVcConfig.class); }
+    @Provides
+    RsVcConfig provideConfig(ConfigManager manager) {
+        return manager.getConfig(RsVcConfig.class);
+    }
 
-    @Override protected void startUp()
-    {
-        muted = false; deaf = false; held = false; keyDown = false; eligible = false;
-        ignored = Collections.emptySet();
-        diagnostics = new VoiceDiagnostics();
+    @Override
+    protected void startUp() {
+        muted = false;
+        deaf = false;
+        held = false;
+        keyDown = false;
+        eligible = false;
+        focused = client.getCanvas().isFocusOwner();
+        devicePicker =
+                new AudioDevicePicker(
+                        (mic, output) ->
+                                clientThread.invokeLater(
+                                        () -> {
+                                            if (!started) {
+                                                return;
+                                            }
+                                            if (mic.equals(config.microphone())
+                                                    && output.equals(config.speakers())) {
+                                                return;
+                                            }
+                                            restartConnection("Updating audio devices");
+                                            configManager.setConfiguration(
+                                                    RsVcConfig.GROUP, "microphone", mic);
+                                            configManager.setConfiguration(
+                                                    RsVcConfig.GROUP, "speakers", output);
+                                        }));
         started = true;
-        SwingUtilities.invokeLater(() -> {
-            if (!started) return;
-            panel = new VoicePanel((channel, key) -> clientThread.invokeLater(() -> join(channel, key)),
-                () -> clientThread.invokeLater(() -> leave("Disconnected")),
-                value -> clientThread.invokeLater(() -> { muted = value; release(); }),
-                value -> clientThread.invokeLater(() -> { deaf = value; release(); if (audio != null) audio.deafen(value); updateListening(); }),
-                (id, value) -> clientThread.invokeLater(() -> {
-                    for (VoiceConnection.Peer peer : peers) if (peer.id == id) mutedNames.add(VoiceConnection.normalize(peer.name));
-                    if (audio != null) audio.block(id); updateListening(); }),
-                () -> clientThread.invokeLater(() -> { mutedNames.clear(); blocked.clear(); updateListening(); }),
-                () -> diagnostics.show(panel));
-            BufferedImage icon = new BufferedImage(24, 24, BufferedImage.TYPE_INT_ARGB);
-            Graphics2D g = icon.createGraphics(); g.setColor(new Color(85, 200, 160));
-            g.fillRoundRect(9, 2, 6, 13, 5, 5); g.drawArc(5, 6, 14, 13, 180, 180); g.drawLine(12, 19, 12, 23); g.dispose();
-            navigation = NavigationButton.builder().tooltip("RS Voice Chat").icon(icon).priority(8).panel(panel).build();
-            toolbar.addNavigation(navigation);
-        });
+        connectionWanted = true;
+        SwingUtilities.invokeLater(
+                () -> {
+                    if (!started) {
+                        return;
+                    }
+                    captureFocus =
+                            new CaptureFocus(
+                                    client.getCanvas(),
+                                    () -> {
+                                        keyDown = false;
+                                        release();
+                                    });
+                    panel =
+                            new VoicePanel(
+                                    () -> clientThread.invokeLater(this::join),
+                                    () -> clientThread.invokeLater(() -> leave("Disconnected")),
+                                    value ->
+                                            clientThread.invokeLater(
+                                                    () -> {
+                                                        muted = value;
+                                                        release();
+                                                    }),
+                                    value ->
+                                            clientThread.invokeLater(
+                                                    () -> {
+                                                        deaf = value;
+                                                        release();
+                                                        if (audio != null) {
+                                                            audio.deafen(value);
+                                                        }
+                                                        updateListening();
+                                                    }),
+                                    (id, value) ->
+                                            clientThread.invokeLater(
+                                                    () -> {
+                                                        for (VoiceConnection.Peer peer : peers) {
+                                                            if (peer.id == id) {
+                                                                if (value) {
+                                                                    mutedNames.add(peer.name);
+                                                                } else {
+                                                                    mutedNames.remove(peer.name);
+                                                                }
+                                                            }
+                                                        }
+                                                        if (audio != null) {
+                                                            audio.block(id);
+                                                        }
+                                                        updateListening();
+                                                    }),
+                                    (id, level) ->
+                                            clientThread.invokeLater(
+                                                    () -> {
+                                                        for (VoiceConnection.Peer peer : peers) {
+                                                            if (peer.id == id) {
+                                                                speakerVolumes.put(
+                                                                        peer.name, level);
+                                                            }
+                                                        }
+                                                        updateListening();
+                                                    }),
+                                    () ->
+                                            clientThread.invokeLater(
+                                                    () -> {
+                                                        mutedNames.clear();
+                                                        blocked.clear();
+                                                        speakerVolumes
+                                                                .entrySet()
+                                                                .removeIf(e -> e.getValue() == 0);
+                                                        updateListening();
+                                                        refreshPeers();
+                                                    }),
+                                    () ->
+                                            devicePicker.show(
+                                                    panel, config.microphone(), config.speakers()));
+                    panel.roomActions(
+                            (action, code) ->
+                                    clientThread.invokeLater(
+                                            () -> {
+                                                VoiceConnection current = connection;
+                                                if (current == null || !current.roomsAvailable()) {
+                                                    status("Connect and log in before using rooms");
+                                                    return;
+                                                }
+                                                release();
+                                                if (audio != null) {
+                                                    audio.clearPlayback();
+                                                }
+                                                current.room(action, code);
+                                            }));
+                    BufferedImage icon = new BufferedImage(24, 24, BufferedImage.TYPE_INT_ARGB);
+                    Graphics2D g = icon.createGraphics();
+                    g.setColor(new Color(85, 200, 160));
+                    g.fillRoundRect(9, 2, 6, 13, 5, 5);
+                    g.drawArc(5, 6, 14, 13, 180, 180);
+                    g.drawLine(12, 19, 12, 23);
+                    g.dispose();
+                    navigation =
+                            NavigationButton.builder()
+                                    .tooltip("RS Voice Chat")
+                                    .icon(icon)
+                                    .priority(8)
+                                    .panel(panel)
+                                    .build();
+                    toolbar.addNavigation(navigation);
+                    clientThread.invokeLater(
+                            () -> {
+                                if (started && connectionWanted) {
+                                    join();
+                                }
+                            });
+                });
         keyManager.registerKeyListener(this);
+        speakingOverlay = new SpeakingOverlay(client, () -> speakingPlayers);
+        overlayManager.add(speakingOverlay);
     }
 
-    @Override protected void shutDown()
-    {
-        started = false; leave("Disconnected"); keyManager.unregisterKeyListener(this);
-        diagnostics.close();
-        SwingUtilities.invokeLater(() -> { if (navigation != null) toolbar.removeNavigation(navigation); navigation = null; });
+    @Override
+    protected void shutDown() {
+        started = false;
+        CaptureFocus focus = captureFocus;
+        captureFocus = null;
+        if (focus != null) {
+            focus.close();
+        }
+        leave("Disconnected");
+        observer = VoiceObserver.NONE;
+        overlayManager.remove(speakingOverlay);
+        keyManager.unregisterKeyListener(this);
+        devicePicker.close();
+        SwingUtilities.invokeLater(
+                () -> {
+                    if (navigation != null) {
+                        toolbar.removeNavigation(navigation);
+                    }
+                    navigation = null;
+                });
     }
 
-    private void status(String text) { VoicePanel current = panel; if (current != null) current.status(text); }
+    private void status(String text) {
+        VoicePanel current = panel;
+        if (current != null) {
+            current.status(text);
+        }
+    }
 
-    private void join(String channel, String token)
-    {
+    private void join() {
+        if (connection != null || retryAt != 0) {
+            return;
+        }
         leave("Connecting…");
-        if (!started || !config.consent()) { status("Enable voice consent in plugin settings first"); return; }
+        if (!started) {
+            return;
+        }
+        connectionWanted = true;
         Player player = client.getLocalPlayer();
-        if (client.getGameState() != GameState.LOGGED_IN || player == null) { status("Log in before joining voice"); return; }
-        try { VoiceConnection.validateEndpoint(config.endpoint()); channel = VoiceConnection.validateChannel(channel); VoiceConnection.validatePassword(token); }
-        catch (IllegalArgumentException e) { status(e.getMessage()); return; }
-        if (player.getName() == null) { status("Character name unavailable — try joining again"); return; }
-        String name = player.getName().replace('\u00a0', ' ');
-        if (!name.matches("[A-Za-z0-9 _-]{1,12}")) { status("Unsupported character name"); return; }
-        sessionKey = token; sessionChannel = channel; sessionName = name;
-        diagnostics.metrics.profile(config.baselineAudio());
+        if (client.getGameState() != GameState.LOGGED_IN || player == null) {
+            status("Waiting for login");
+            return;
+        }
+        try {
+            VoiceConnection.validateEndpoint(relayEndpoint());
+        } catch (IllegalArgumentException e) {
+            connectionWanted = false;
+            status(e.getMessage());
+            return;
+        }
+        sessionName = VoiceAlias.create();
+        if (panel != null) {
+            panel.alias(sessionName);
+            panel.connectionActive(true);
+        }
         openConnection();
     }
 
-    private void openConnection()
-    {
+    private void openConnection() {
         retryAt = 0;
         // Callbacks from an old connection must never stop or feed a newer audio session.
         VoiceConnection[] owner = new VoiceConnection[1];
-        VoiceConnection next = new VoiceConnection(gson, sessionName,
-            message -> clientThread.invokeLater(() -> { if (connection == owner[0]) status(message); }),
-            roster -> clientThread.invokeLater(() -> {
-                if (connection != owner[0]) return;
-                peers = roster;
-                for (VoiceConnection.Peer peer : roster) knownPeers.put(peer.id, VoiceConnection.normalize(peer.name));
-                while (knownPeers.size() > 128) knownPeers.remove(knownPeers.keySet().iterator().next());
-                if (panel != null) panel.peers(roster); updateListening();
-            }),
-            packet -> { AudioEngine current = audio; if (connection == owner[0] && current != null && eligible && System.nanoTime() - eligibleAt < 2_500_000_000L) current.receive(packet); },
-            retry -> clientThread.invokeLater(() -> {
-                if (connection != owner[0]) return;
-                connection = null; stopAudio(); peers = Collections.emptyList(); knownPeers.clear(); blocked.clear();
-                long delay = retry ? reconnect.nextDelayMillis() : -1;
-                if (delay < 0) { sessionKey = ""; sessionChannel = ""; status("Disconnected — check channel, password and relay; join again"); }
-                else { retryAt = System.nanoTime() + (delay + java.util.concurrent.ThreadLocalRandom.current().nextLong(500)) * 1_000_000;
-                    status("Voice interrupted — reconnecting shortly; release push-to-talk"); }
-            }), diagnostics.metrics);
+        VoiceConnection next =
+                new VoiceConnection(
+                        gson,
+                        sessionName,
+                        message ->
+                                clientThread.invokeLater(
+                                        () -> {
+                                            if (connection == owner[0]) {
+                                                if (panel != null) {
+                                                    panel.connected(owner[0].isOpen());
+                                                }
+                                                status(message);
+                                            }
+                                        }),
+                        roster ->
+                                clientThread.invokeLater(
+                                        () -> {
+                                            if (connection != owner[0]) {
+                                                return;
+                                            }
+                                            for (VoiceConnection.Peer previous : peers) {
+                                                if (roster.stream()
+                                                                .noneMatch(p -> p.id == previous.id)
+                                                        && audio != null) {
+                                                    audio.block(previous.id);
+                                                }
+                                            }
+                                            peers = roster;
+                                            refreshPeers();
+                                            updateListening();
+                                            if (held) {
+                                                captureStatus(owner[0]);
+                                            } else if (roster.isEmpty()) {
+                                                status("No other voices");
+                                            } else if (!owner[0].canTransmit()) {
+                                                status("No listeners available");
+                                            } else if (!held) {
+                                                status(
+                                                        config.voiceMode() == VoiceMode.PUSH_TO_TALK
+                                                                ? "Connected — hold push-to-talk to"
+                                                                        + " speak"
+                                                                : "Connected — voice-activated"
+                                                                        + " mode");
+                                            }
+                                        }),
+                        packet -> {
+                            AudioEngine current = audio;
+                            if (connection == owner[0]
+                                    && current != null
+                                    && eligible
+                                    && System.nanoTime() - eligibleAt < 2_500_000_000L) {
+                                current.receive(packet);
+                            }
+                        },
+                        reason ->
+                                clientThread.invokeLater(() -> onConnectionEnded(owner[0], reason)),
+                        observer);
         owner[0] = next;
+        next.roomListener(
+                state -> {
+                    if (connection != next) {
+                        return;
+                    }
+                    boolean changed = !sessionRoom.equals(state.code);
+                    sessionRoom = state.code;
+                    // Clear old audio and stop capture before a changed scope can transmit.
+                    if (changed
+                            || "expired".equals(state.reason)
+                            || "unavailable".equals(state.reason)) {
+                        release();
+                        AudioEngine current = audio;
+                        if (current != null) {
+                            current.clearPlayback();
+                        }
+                    }
+                    if ("expired".equals(state.reason) || "unavailable".equals(state.reason)) {
+                        muted = true;
+                        if (panel != null) {
+                            panel.microphoneMuted(true);
+                        }
+                    }
+                    if (panel != null) {
+                        panel.roomState(state.code, "created".equals(state.reason));
+                    }
+                    if ("expired".equals(state.reason)) {
+                        if (panel != null) {
+                            panel.roomExpired();
+                        }
+                        status("Room expired — nearby voice; microphone muted");
+                    } else if ("unavailable".equals(state.reason)) {
+                        status("Room unavailable — microphone muted");
+                    } else if ("created".equals(state.reason)) {
+                        status("Room created — Room → Invite code");
+                    }
+                },
+                sessionRoom);
         connection = next;
-        audio = new AudioEngine(config.microphone(), config.speakers(), () -> Math.max(0, Math.min(100, config.volume())),
-            packet -> { if (connection == next && held && !muted && !deaf && eligible && System.nanoTime() - eligibleAt < 2_500_000_000L) next.transmit(packet); },
-            message -> clientThread.invokeLater(() -> { if (connection == next) leave(message); }),
-            !config.baselineAudio(), diagnostics.metrics,
-            pcm -> { if (connection == next && held && !muted && !deaf && eligible && System.nanoTime() - eligibleAt < 2_500_000_000L) diagnostics.recording.append(pcm); });
+        audio =
+                new AudioEngine(
+                        config.microphone(),
+                        config.speakers(),
+                        () -> Math.max(0, Math.min(100, config.volume())),
+                        packet -> {
+                            if (connection == next
+                                    && held
+                                    && !muted
+                                    && !deaf
+                                    && eligible
+                                    && System.nanoTime() - eligibleAt < 2_500_000_000L) {
+                                next.transmit(packet);
+                            }
+                        },
+                        next::canTransmit,
+                        message ->
+                                clientThread.invokeLater(
+                                        () -> {
+                                            if (connection == next) {
+                                                leave(message);
+                                            }
+                                        }),
+                        true,
+                        observer);
         audio.deafen(deaf);
         updateListening();
-        try { next.connect(http, config.endpoint(), sessionChannel, sessionKey); }
-        catch (RuntimeException e) { leave("Could not connect: " + e.getMessage()); }
+        try {
+            next.connect(http, relayEndpoint());
+        } catch (RuntimeException e) {
+            leave("Could not connect: " + e.getMessage());
+        }
     }
 
-    private void stopAudio()
-    {
-        eligible = false; release(); AudioEngine current = audio; audio = null; if (current != null) current.close();
-        diagnostics.recording.stop();
-        VoicePanel view = panel; if (view != null) view.peers(Collections.emptyList());
-    }
-    private void leave(String message)
-    {
-        VoiceConnection current = connection; connection = null; if (current != null) current.close();
-        stopAudio(); blocked.clear(); status(message);
-        mutedNames.clear(); peers = Collections.emptyList(); knownPeers.clear(); sessionKey = ""; sessionChannel = ""; sessionName = ""; retryAt = 0; reconnect.reset();
-        if (panel != null) panel.mutedCount(0);
+    private void onConnectionEnded(VoiceConnection source, DisconnectReason reason) {
+        if (connection != source) {
+            return;
+        }
+        connection = null;
+        stopAudio();
+        peers = Collections.emptyList();
+        blocked.clear();
+        if (panel != null) {
+            panel.roomsEnabled(false);
+            panel.connected(false);
+        }
+        long delay = reconnect.nextDelayMillis(reason);
+        if (delay < 0) {
+            connectionWanted = false;
+            sessionName = "";
+            if (panel != null) {
+                panel.alias("");
+                panel.connectionActive(false);
+            }
+            status("Disconnected — relay rejection or repeated identity conflict");
+            return;
+        }
+        if (reason == DisconnectReason.ALIAS_IN_USE) {
+            sessionName = VoiceAlias.replacement(sessionName);
+            if (panel != null) {
+                panel.alias(sessionName);
+            }
+            status("Alias was taken — retrying with a new random alias");
+        } else if (reason == DisconnectReason.IDENTITY_IN_USE) {
+            status("Character already connected — waiting for the previous connection to clear");
+        } else {
+            status(
+                    config.localTesting()
+                            ? "Local relay interrupted — start it or turn off local testing"
+                            : "Voice interrupted — reconnecting shortly; release push-to-talk");
+        }
+        long jitter = java.util.concurrent.ThreadLocalRandom.current().nextLong(500);
+        retryAt = System.nanoTime() + (delay + jitter) * 1_000_000;
     }
 
-    @Subscribe public void onGameTick(GameTick tick)
-    {
-        if (retryAt != 0)
-        {
-            if (!started || !config.consent() || client.getGameState() != GameState.LOGGED_IN) { leave("Disconnected"); return; }
-            if (System.nanoTime() >= retryAt) openConnection();
+    private String relayEndpoint() {
+        return config.localTesting() ? "ws://127.0.0.1:8787/v1/voice" : RsVcConfig.HOSTED_RELAY;
+    }
+
+    /** Attach/detach optional tooling on the client thread; no counters exist in the plugin. */
+    public boolean observe(VoiceObserver next) {
+        observer = started ? java.util.Objects.requireNonNull(next) : VoiceObserver.NONE;
+        if (connection != null) {
+            connection.observer(observer);
+        } else {
+            observer.connected(false);
+        }
+        if (audio != null) {
+            audio.observer(observer);
+        }
+        return started;
+    }
+
+    /**
+     * Give a local diagnostic exclusive device ownership until Connect, settings change or
+     * shutdown.
+     */
+    public boolean beginLocalAudioTest(Runnable cleanup, BooleanSupplier speaking) {
+        if (!started) {
+            return false;
+        }
+        leave("Local audio test");
+        localTestCleanup = java.util.Objects.requireNonNull(cleanup);
+        localTestSpeaking = java.util.Objects.requireNonNull(speaking);
+        return true;
+    }
+
+    public void endLocalAudioTest(Runnable owner) {
+        if (localTestCleanup == owner) {
+            endLocalAudioTest();
+        }
+    }
+
+    private void endLocalAudioTest() {
+        Runnable cleanup = localTestCleanup;
+        localTestCleanup = null;
+        localTestSpeaking = null;
+        speakingPlayers = Collections.emptyList();
+        if (cleanup != null) {
+            cleanup.run();
+        }
+    }
+
+    private void stopAudio() {
+        endLocalAudioTest();
+        matchedPlayers.clear();
+        speakingPlayers = Collections.emptyList();
+        eligible = false;
+        release();
+        AudioEngine current = audio;
+        audio = null;
+        if (current != null) {
+            current.close();
+        }
+        VoicePanel view = panel;
+        if (view != null) {
+            view.peers(Collections.emptyList());
+        }
+    }
+
+    private void leave(String message) {
+        connectionWanted = false;
+        VoiceConnection current = connection;
+        connection = null;
+        if (current != null) {
+            current.close();
+        }
+        stopAudio();
+        blocked.clear();
+        status(message);
+        mutedNames.clear();
+        speakerVolumes.clear();
+        peers = Collections.emptyList();
+        sessionName = "";
+        sessionRoom = "";
+        retryAt = 0;
+        reconnect.reset();
+        visiblePlayers.clear();
+        trackedView = null;
+        matcher.clear();
+        if (panel != null) {
+            panel.mutedCount(0);
+            panel.alias("");
+            panel.connectionActive(false);
+            panel.roomState("");
+            panel.roomsEnabled(false);
+        }
+    }
+
+    private void restartConnection(String message) {
+        boolean resume = connectionWanted;
+        leave(message);
+        connectionWanted = resume;
+    }
+
+    private void awaitLogin() {
+        restartConnection(connectionWanted ? "Waiting for login" : "Disconnected");
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick tick) {
+        if (started
+                && connectionWanted
+                && connection == null
+                && retryAt == 0
+                && client.getGameState() == GameState.LOGGED_IN) {
+            join();
+        }
+        if (retryAt != 0) {
+            if (!started || client.getGameState() != GameState.LOGGED_IN) {
+                awaitLogin();
+                return;
+            }
+            if (System.nanoTime() >= retryAt) {
+                openConnection();
+            }
+        }
+        updateProximity();
+    }
+
+    @Subscribe
+    public void onPlayerSpawned(PlayerSpawned event) {
+        if (connection != null) {
+            visiblePlayers.add(event.getPlayer());
+        }
+    }
+
+    @Subscribe
+    public void onPlayerDespawned(PlayerDespawned event) {
+        visiblePlayers.remove(event.getPlayer());
+        matchedPlayers.values().removeIf(player -> player == event.getPlayer());
+    }
+
+    private void updateProximity() {
+        VoiceConnection current = connection;
+        Player self = client.getLocalPlayer();
+        if (current == null || client.getGameState() != GameState.LOGGED_IN || self == null) {
+            return;
+        }
+        String salt = current.matchingSalt();
+        if (salt.isEmpty() || self.getName() == null || self.getWorldView() == null) {
+            return;
+        }
+        WorldView view = self.getWorldView();
+        if (view != trackedView) {
+            // Seed once when connecting or changing scenes; spawn/despawn events maintain this set.
+            visiblePlayers.clear();
+            for (Player player : view.players()) {
+                visiblePlayers.add(player);
+            }
+            trackedView = view;
+        }
+        WorldPoint origin = self.getWorldLocation();
+        Map<String, Player> namedPlayers = new HashMap<>();
+        Set<String> nearbyNames = new HashSet<>();
+        for (Player player : visiblePlayers) {
+            if (player == self || player.getName() == null || player.getWorldView() != view) {
+                continue;
+            }
+            WorldPoint point = player.getWorldLocation();
+            if (point.getPlane() != origin.getPlane()) {
+                continue;
+            }
+            if (ProximityMatcher.inRange(
+                    origin.getX(),
+                    origin.getY(),
+                    origin.getPlane(),
+                    point.getX(),
+                    point.getY(),
+                    point.getPlane(),
+                    true)) {
+                namedPlayers.put(player.getName(), player);
+                nearbyNames.add(player.getName());
+            } else if (current.inRoom()) {
+                // A room member may be visible outside the ordinary proximity radius.
+                namedPlayers.put(player.getName(), player);
+            }
+        }
+        try {
+            Map<String, Long> matches =
+                    matcher.matchNames(
+                            salt, client.getWorld(), namedPlayers.keySet(), current.directory());
+            Set<Long> nearby = new HashSet<>();
+            matchedPlayers.clear();
+            matches.forEach(
+                    (name, id) -> {
+                        matchedPlayers.put(id, namedPlayers.get(name));
+                        if (nearbyNames.contains(name)) {
+                            nearby.add(id);
+                        }
+                    });
+            eligible = true;
+            eligibleAt = System.nanoTime();
+            current.proximity(
+                    salt, VoiceIdentity.token(salt, self.getName(), client.getWorld()), nearby);
+            if (!current.inRoom()) {
+                for (VoiceConnection.Peer peer : peers) {
+                    if (!nearby.contains(peer.id) && audio != null) {
+                        audio.block(peer.id);
+                    }
+                }
+            }
+            if (panel != null) {
+                panel.roomsEnabled(current.roomsAvailable());
+            }
+        } catch (IllegalArgumentException invalid) {
+            pause("Voice paused — character unavailable");
+        }
+    }
+
+    @Subscribe
+    public void onClientTick(ClientTick tick) {
+        updateSpeakingIndicators();
+        VoiceConnection current = connection;
+        if (current == null) {
+            return;
+        }
+        if (!started) {
+            leave("Disconnected");
+            return;
+        }
+        GameState state = client.getGameState();
+        if (state == GameState.LOGIN_SCREEN || state == GameState.CONNECTION_LOST) {
+            awaitLogin();
+            return;
+        }
+        boolean loggedIn = state == GameState.LOGGED_IN && client.getLocalPlayer() != null;
+        if (eligible && !loggedIn) {
+            pause("Voice paused while loading");
+        }
+        if (eligible && System.nanoTime() - eligibleAt >= 2_500_000_000L) {
+            pause("Voice paused — waiting for game updates");
+        }
+        current.heartbeat();
+        current.checkHealth();
+        if (current.isStable()) {
+            reconnect.reset();
+        }
+        if (config.voiceMode() == VoiceMode.VOICE_ACTIVATED) {
+            if (canCapture(current)) {
+                if (!held) {
+                    held = true;
+                    audio.startCapture();
+                    captureStatus(current);
+                }
+            } else {
+                release();
+            }
+        } else if (held && !canCapture(current)) {
+            release();
+        }
+    }
+
+    private boolean canCapture(VoiceConnection current) {
+        CaptureFocus focus = captureFocus;
+        return started
+                && (config.voiceMode() == VoiceMode.VOICE_ACTIVATED
+                        ? focus != null && focus.isActive()
+                        : focused)
+                && !muted
+                && !deaf
+                && eligible
+                && audio != null
+                && current != null
+                && current.isOpen()
+                && (current.canTransmit() || config.speakingIndicators());
+    }
+
+    private void captureStatus(VoiceConnection current) {
+        status(current.canTransmit() ? "Microphone on" : "Local mic only");
+    }
+
+    private void pause(String reason) {
+        eligible = false;
+        eligibleAt = 0;
+        release();
+        if (audio != null) {
+            audio.clearPlayback();
         }
         VoiceConnection current = connection;
-        if (current == null) return;
-        Set<String> names = new HashSet<>();
-        for (Ignore ignore : client.getIgnoreContainer().getMembers()) names.add(VoiceConnection.normalize(ignore.getName()));
-        if (!names.equals(ignored)) { ignored = names; if (audio != null) audio.clearPlayback(); updateListening(); }
-    }
-
-    @Subscribe public void onClientTick(ClientTick tick)
-    {
-        VoiceConnection current = connection;
-        if (current == null) return;
-        if (!started || !config.consent()) { leave("Disconnected"); return; }
-        GameState state = client.getGameState();
-        if (state == GameState.LOGIN_SCREEN || state == GameState.CONNECTION_LOST) { leave("Disconnected — log in and join again"); return; }
-        boolean loggedIn = state == GameState.LOGGED_IN && client.getLocalPlayer() != null;
-        boolean resumed = !eligible && loggedIn;
-        if (eligible && !loggedIn) pause("Voice paused while loading");
-        eligible = loggedIn;
-        eligibleAt = System.nanoTime();
-        current.heartbeat(eligible); current.checkHealth();
-        if (resumed && current.canTransmit()) status("Connected — microphone idle");
-        if (current.isStable()) reconnect.reset();
-    }
-
-    private void pause(String reason)
-    {
-        eligible = false; eligibleAt = 0; release(); if (audio != null) audio.clearPlayback();
-        VoiceConnection current = connection;
-        if (current != null) current.heartbeat(false);
+        if (current != null) {
+            current.proximity(current.matchingSalt(), "", Collections.emptySet());
+        }
+        visiblePlayers.clear();
+        matchedPlayers.clear();
+        speakingPlayers = Collections.emptyList();
+        trackedView = null;
+        matcher.clear();
         status(reason);
     }
 
-    private void updateListening()
-    {
+    private void updateListening() {
         Set<Long> nextBlocked = new HashSet<>();
-        for (Map.Entry<Long, String> peer : knownPeers.entrySet())
-            if (nextBlocked.size() < 64 && (mutedNames.contains(peer.getValue()) || ignored.contains(peer.getValue()))) nextBlocked.add(peer.getKey());
-        blocked.clear(); blocked.addAll(nextBlocked);
-        VoiceConnection current = connection; if (current != null) current.listening(deaf, blocked, ignored);
-        if (panel != null) panel.mutedCount(mutedNames.size());
+        Set<String> quiet = new HashSet<>(mutedNames);
+        Map<Long, Integer> levels = new HashMap<>();
+        for (Map.Entry<String, Integer> entry : speakerVolumes.entrySet()) {
+            if (entry.getValue() == 0) {
+                quiet.add(entry.getKey());
+            }
+        }
+        for (VoiceConnection.Peer peer : peers) {
+            if (quiet.contains(peer.name)) {
+                nextBlocked.add(peer.id);
+            }
+            levels.put(peer.id, speakerVolumes.getOrDefault(peer.name, 100));
+        }
+        blocked.clear();
+        blocked.addAll(nextBlocked);
+        VoiceConnection current = connection;
+        if (current != null) {
+            current.mutedAliases(quiet);
+            current.listening(deaf, blocked);
+        }
+        if (audio != null) {
+            audio.volumes(levels);
+            for (long id : blocked) {
+                audio.block(id);
+            }
+        }
+        if (panel != null) {
+            panel.mutedCount(quiet.size());
+        }
     }
 
-    @Subscribe public void onGameStateChanged(GameStateChanged event)
-    {
-        if (connection == null && retryAt == 0) return;
-        if (event.getGameState() == GameState.LOGIN_SCREEN || event.getGameState() == GameState.CONNECTION_LOST)
-            leave("Disconnected — log in and join again");
-        else if (event.getGameState() != GameState.LOGGED_IN) pause("Voice paused while loading");
+    private void refreshPeers() {
+        if (panel != null) {
+            panel.peers(peers, new HashMap<>(speakerVolumes), new HashSet<>(mutedNames));
+        }
     }
-    @Subscribe public void onFocusChanged(FocusChanged event) { if (!event.isFocused()) release(); }
-    @Subscribe public void onConfigChanged(ConfigChanged event)
-    {
-        if (!RsVcConfig.GROUP.equals(event.getGroup())) return;
-        // Explicitly rejoin after changes to destination, consent, devices or audio profile.
-        if (!"volume".equals(event.getKey())) clientThread.invokeLater(() -> leave("Settings changed — join again"));
+
+    @Subscribe
+    public void onGameStateChanged(GameStateChanged event) {
+        if (connection == null && retryAt == 0) {
+            return;
+        }
+        if (event.getGameState() == GameState.LOGIN_SCREEN
+                || event.getGameState() == GameState.CONNECTION_LOST) {
+            awaitLogin();
+        } else if (event.getGameState() != GameState.LOGGED_IN) {
+            pause("Voice paused while loading");
+        }
     }
-    @Override public void keyPressed(KeyEvent event)
-    {
-        if (!config.pushToTalk().matches(event) || keyDown) return;
+
+    @Subscribe
+    public void onFocusChanged(FocusChanged event) {
+        focused = event.isFocused();
+        if (!focused) {
+            keyDown = false;
+            if (config.voiceMode() == VoiceMode.PUSH_TO_TALK) {
+                release();
+            }
+        }
+    }
+
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event) {
+        if (!RsVcConfig.GROUP.equals(event.getGroup())) {
+            return;
+        }
+        // Retired keys cannot change the fixed destination or grant/revoke a live session.
+        if ("consent".equals(event.getKey())
+                || "endpoint".equals(event.getKey())
+                || "baselineAudio".equals(event.getKey())
+                || "noiseReduction".equals(event.getKey())) {
+            return;
+        }
+        // Capture policy is local: preserve the socket, room and participant preferences.
+        if ("voiceMode".equals(event.getKey()) || "pushToTalk".equals(event.getKey())) {
+            clientThread.invokeLater(
+                    () -> {
+                        endLocalAudioTest();
+                        release();
+                        keyDown = false;
+                        // Voice activation resumes on the next tick if capture is eligible.
+                    });
+            return;
+        }
+        // Only the destination and device changes require rebuilding this session.
+        if ("localTesting".equals(event.getKey())
+                || "microphone".equals(event.getKey())
+                || "speakers".equals(event.getKey())) {
+            clientThread.invokeLater(() -> restartConnection("Updating connection settings"));
+        }
+    }
+
+    @Override
+    public void keyPressed(KeyEvent event) {
+        if (config.voiceMode() != VoiceMode.PUSH_TO_TALK
+                || !config.pushToTalk().matches(event)
+                || keyDown) {
+            return;
+        }
         keyDown = true;
-        AudioEngine current = audio; VoiceConnection network = connection;
-        if (!held && !muted && !deaf && eligible && current != null && network != null && network.canTransmit())
-        { held = true; current.startCapture(); status("Transmitting — release push-to-talk to stop"); }
+        AudioEngine current = audio;
+        VoiceConnection network = connection;
+        if (!held && canCapture(network)) {
+            held = true;
+            current.startCapture();
+            captureStatus(network);
+        }
     }
-    @Override public void keyReleased(KeyEvent event)
-    {
-        if (event.getKeyCode() == config.pushToTalk().getKeyCode() || !config.pushToTalk().matches(event)) { keyDown = false; release(); }
+
+    @Override
+    public void keyReleased(KeyEvent event) {
+        if (event.getKeyCode() == config.pushToTalk().getKeyCode()
+                || !config.pushToTalk().matches(event)) {
+            keyDown = false;
+            if (config.voiceMode() == VoiceMode.PUSH_TO_TALK) {
+                release();
+            }
+        }
     }
-    @Override public void keyTyped(KeyEvent event) {}
-    private void release()
-    {
-        boolean wasHeld = held; held = false;
-        AudioEngine current = audio; if (current != null && wasHeld) current.stopCapture();
-        if (wasHeld) status("Connected — microphone idle");
+
+    @Override
+    public void keyTyped(KeyEvent event) {}
+
+    private void release() {
+        boolean wasHeld = held;
+        held = false;
+        AudioEngine current = audio;
+        if (current != null && wasHeld) {
+            current.stopCapture();
+        }
+        if (wasHeld) {
+            status("Connected — microphone idle");
+        }
+    }
+
+    private void updateSpeakingIndicators() {
+        long now = System.nanoTime();
+        if (now < nextSpeakingUpdate) {
+            return;
+        }
+        nextSpeakingUpdate = now + 100_000_000L;
+        Player self = client.getLocalPlayer();
+        if (!started
+                || !config.speakingIndicators()
+                || client.getGameState() != GameState.LOGGED_IN
+                || self == null) {
+            speakingPlayers = Collections.emptyList();
+            return;
+        }
+        List<Player> active = new ArrayList<>();
+        BooleanSupplier testSpeaking = localTestSpeaking;
+        AudioEngine current = audio;
+        boolean live = eligible && now - eligibleAt < 2_500_000_000L;
+        if ((testSpeaking != null && testSpeaking.getAsBoolean())
+                || (live
+                        && current != null
+                        && held
+                        && !muted
+                        && !deaf
+                        && current.microphoneSpeaking())) {
+            active.add(self);
+        }
+        if (live && current != null && !deaf) {
+            for (long id : current.speaking()) {
+                Player player = matchedPlayers.get(id);
+                if (player != null && visiblePlayers.contains(player) && !blocked.contains(id)) {
+                    active.add(player);
+                }
+            }
+        }
+        speakingPlayers = active;
     }
 }

@@ -19,3 +19,16 @@ node_modules/
 /concentus-master/
 /realtime-examples/
 /plugin-hub-tooling/
+/hints/
+/archive/
+/.wrangler/
+/dev/
+/.run/
+
+# Release repository: local tests, automation and working instructions stay on disk.
+/src/test/
+/.github/
+/Agents.MD
+/docs/
+/tools/
+/.editorconfig

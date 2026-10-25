@@ -1,40 +1,93 @@
 package com.rsvc;
 
-import java.awt.event.KeyEvent;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
 import net.runelite.client.config.Keybind;
 import net.runelite.client.config.Range;
 
+import java.awt.event.KeyEvent;
+
 @ConfigGroup(RsVcConfig.GROUP)
-public interface RsVcConfig extends Config
-{
+public interface RsVcConfig extends Config {
     String GROUP = "rsvc";
+    // Owned relay; the dev helper can still explicitly select loopback.
+    String HOSTED_RELAY = "wss://51.81.34.93/v1/voice";
 
-    @ConfigItem(keyName = "consent", name = "Allow voice connection", position = 0,
-        description = "Sends your microphone audio while talking and RS name to your selected third-party relay while logged in. The relay sees your IP. Names/login status are self-reported; no world or location is sent. Local mic recording is off until started in Stats / test.",
-        warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers")
-    default boolean consent() { return false; }
+    @ConfigItem(
+            keyName = "speakingIndicators",
+            name = "Speaking indicators",
+            position = 9,
+            description =
+                    "Show a green bubble above players while their voice is active. When alone,"
+                        + " reads mic levels locally under your voice-mode controls; sends no audio"
+                        + " without a listener.")
+    default boolean speakingIndicators() {
+        return true;
+    }
 
-    @ConfigItem(keyName = "endpoint", name = "Relay URL", position = 1, description = "Your deployed wss:// relay URL ending /v1/voice. Only loopback permits ws:// for testing. Changing this disconnects.")
-    default String endpoint() { return ""; }
+    @ConfigItem(
+            keyName = "localTesting",
+            name = "Use local test relay",
+            position = 6,
+            description =
+                    "Use ws://127.0.0.1:8787/v1/voice instead of the hosted relay."
+                            + " Reconnects when changed.")
+    default boolean localTesting() {
+        return false;
+    }
 
-    @ConfigItem(keyName = "pushToTalk", name = "Push-to-talk", position = 2, description = "Hold while RuneLite is focused to transmit. Microphone is opened only while held.")
-    default Keybind pushToTalk() { return new Keybind(KeyEvent.VK_V, KeyEvent.CTRL_DOWN_MASK); }
+    @ConfigItem(
+            keyName = "voiceMode",
+            name = "Voice mode",
+            position = 8,
+            description =
+                    "Push-to-talk requires the key. Voice-activated captures automatically while"
+                        + " RuneLite is focused and a listener or local speaking indicator is"
+                        + " available; DTX suppresses silence but noise may transmit. Mute stops"
+                        + " capture. Changing mode keeps your connection and room.")
+    default VoiceMode voiceMode() {
+        return VoiceMode.PUSH_TO_TALK;
+    }
+
+    @ConfigItem(
+            keyName = "pushToTalk",
+            name = "Push-to-talk",
+            position = 2,
+            description =
+                    "In push-to-talk mode, hold while RuneLite is focused to transmit to nearby"
+                            + " listeners.")
+    default Keybind pushToTalk() {
+        return new Keybind(KeyEvent.VK_V, KeyEvent.CTRL_DOWN_MASK);
+    }
 
     @Range(min = 0, max = 100)
-    @ConfigItem(keyName = "volume", name = "Voice volume", position = 3, description = "Playback volume, 0–100 percent")
-    default int volume() { return 80; }
+    @ConfigItem(
+            keyName = "volume",
+            name = "Voice volume",
+            position = 3,
+            description = "Playback volume, 0–100 percent")
+    default int volume() {
+        return 80;
+    }
 
-    @ConfigItem(keyName = "microphone", name = "Microphone", position = 4, description = "Exact Java Sound device name. Blank uses the system default. See the voice panel for available devices.")
-    default String microphone() { return ""; }
+    @ConfigItem(
+            keyName = "microphone",
+            name = "Microphone",
+            position = 4,
+            hidden = true,
+            description = "Selected in Devices. Blank means Default.")
+    default String microphone() {
+        return "";
+    }
 
-    @ConfigItem(keyName = "speakers", name = "Speakers", position = 5, description = "Exact Java Sound device name. Blank uses the system default. Headphones recommended.")
-    default String speakers() { return ""; }
-
-    @ConfigItem(keyName = "baselineAudio", name = "Test baseline: no DTX", position = 7,
-        description = "For bandwidth A/B tests only. Sends every 20ms frame while push-to-talk is held, including silence. Rejoin after changing; statistics reset when the audio profile changes.",
-        warning = "This feature submits your IP address to a 3rd-party server not controlled or verified by RuneLite developers")
-    default boolean baselineAudio() { return false; }
+    @ConfigItem(
+            keyName = "speakers",
+            name = "Speakers",
+            position = 5,
+            hidden = true,
+            description = "Selected in Devices. Blank means Default.")
+    default String speakers() {
+        return "";
+    }
 }
