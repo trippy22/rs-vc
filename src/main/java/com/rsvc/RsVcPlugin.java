@@ -60,8 +60,7 @@ import javax.swing.SwingUtilities;
         name = "RS Voice Chat",
         internalName = "rs-vc",
         description = "Opt-in proximity voice within 20 tiles",
-        tags = {"voice", "proximity", "audio"},
-        enabledByDefault = false)
+        tags = {"voice", "proximity", "audio"})
 public class RsVcPlugin extends Plugin implements KeyListener {
     @Inject private Client client;
     @Inject private ClientThread clientThread;
