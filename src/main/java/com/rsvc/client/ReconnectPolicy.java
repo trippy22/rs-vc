@@ -1,4 +1,6 @@
-package com.rsvc.network;
+package com.rsvc.client;
+
+import com.rsvc.network.DisconnectReason;
 
 /** Network and capacity retries back off independently; policy and identity conflicts are bounded. */
 public final class ReconnectPolicy {

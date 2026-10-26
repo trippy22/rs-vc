@@ -1,10 +1,10 @@
-package com.rsvc;
+package com.rsvc.client;
 
-import net.runelite.api.GameState;
+import com.rsvc.client.VoiceClient.GameState;
 
 /** Client-thread game state and position freshness, independent of room membership. */
 final class GameVoiceSession {
-    private GameState state = GameState.UNKNOWN;
+    private GameState state = GameState.LOGGED_OUT;
     private long positionAt;
 
     void state(GameState next) {
@@ -17,10 +17,7 @@ final class GameVoiceSession {
     boolean ended() {
         switch (state) {
             case LOGGED_IN:
-            case LOADING:
-            case HOPPING:
-            case CONNECTION_LOST:
-            case LOGGING_IN:
+            case TRANSITION:
                 return false;
             default:
                 return true;

@@ -4,13 +4,12 @@ import com.google.gson.Gson;
 import com.google.inject.Provides;
 import com.rsvc.audio.AudioEngine;
 import com.rsvc.network.DisconnectReason;
-import com.rsvc.network.ReconnectPolicy;
+import com.rsvc.client.VoiceClient;
+import com.rsvc.network.VoicePacket;
 import com.rsvc.network.VoiceConnection;
 import com.rsvc.party.PartyVoice;
 import com.rsvc.party.RsVcPartyVoice;
 import com.rsvc.proximity.ProximityMatcher;
-import com.rsvc.proximity.VoiceAlias;
-import com.rsvc.proximity.VoiceIdentity;
 import com.rsvc.ui.AudioDevicePicker;
 import com.rsvc.ui.CaptureFocus;
 import com.rsvc.ui.SpeakingOverlay;
@@ -86,7 +85,6 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     @Inject private WSClient partySocket;
 
     private final PartyVoice partyVoice = new PartyVoice();
-    private volatile boolean partyVoiceSelected;
 
     private VoicePanel panel;
     private VoiceObserver observer = VoiceObserver.NONE;
@@ -99,14 +97,11 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     private AudioDevicePicker devicePicker;
     private NavigationButton navigation;
     // These references/flags are also read by WebSocket and audio callbacks.
-    private volatile VoiceConnection connection;
     private volatile AudioEngine audio;
     private volatile boolean muted;
     private volatile boolean deaf;
     private volatile boolean held;
     private volatile boolean keyDown;
-    private volatile boolean eligible;
-    private volatile long eligibleAt;
     private volatile boolean started;
     private volatile boolean focused;
     private volatile CaptureFocus captureFocus;
@@ -117,18 +112,9 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     private List<VoiceConnection.Peer> peers = Collections.emptyList();
     private final java.util.concurrent.atomic.AtomicReference<Runnable> pendingRoster =
             new java.util.concurrent.atomic.AtomicReference<>();
-    private final ReconnectPolicy reconnect = new ReconnectPolicy();
-    private final GameVoiceSession gameSession = new GameVoiceSession();
-    private long retryAt;
-    // Client-thread intent: explicit Disconnect stays off until Connect or plugin re-enable.
-    private boolean connectionWanted;
+    private final VoiceClient voice = new VoiceClient();
     private volatile boolean localTesting;
-    private String sessionName = "";
-    private volatile String sessionRoom = "";
-    private boolean roomRecoveryPaused;
-    // Last validated own identity only; retained across transitions, cleared on logout.
-    private String sessionCharacter = "", identitySalt = "", identityToken = "";
-    private int sessionWorld;
+
     private final Set<Player> visiblePlayers =
             Collections.newSetFromMap(new java.util.IdentityHashMap<>());
     private final ProximityMatcher matcher = new ProximityMatcher();
@@ -158,7 +144,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         deaf = false;
         held = false;
         keyDown = false;
-        eligible = false;
+        voice.invalidateAudio();
         focused = client.getCanvas().isFocusOwner();
         devicePicker =
                 new AudioDevicePicker(
@@ -178,7 +164,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                                                     RsVcConfig.GROUP, "speakers", output);
                                         }));
         started = true;
-        connectionWanted = true;
+        voice.requestConnection();
         SwingUtilities.invokeLater(
                 () -> {
                     if (!started) {
@@ -245,10 +231,10 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                             (action, code) ->
                                     clientThread.invokeLater(
                                             () -> {
-                                                if (partyVoiceSelected) {
+                                                if (voice.partySelected()) {
                                                     return;
                                                 }
-                                                VoiceConnection current = connection;
+                                                VoiceConnection current = voice.connection();
                                                 if (current == null || !current.roomsAvailable()) {
                                                     status("Connect and log in before using rooms");
                                                     return;
@@ -257,9 +243,8 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                                                 if (audio != null) {
                                                     audio.clearPlayback();
                                                 }
-                                                current.room(action, code);
-                                                roomRecoveryPaused = current.roomRecoveryPaused();
-                                                panel.roomRecovery(roomRecoveryPaused);
+                                                voice.requestRoom(action, code);
+                                                panel.roomRecovery(voice.recoveryPaused());
                                             }));
                     panel.roomRecoveryActions(
                             () -> clientThread.invokeLater(() -> recoverRoom(true)),
@@ -282,7 +267,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                     toolbar.addNavigation(navigation);
                     clientThread.invokeLater(
                             () -> {
-                                if (started && connectionWanted) {
+                                if (started && voice.connectionWanted()) {
                                     join();
                                 }
                             });
@@ -335,14 +320,14 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void join() {
-        if (connection != null || retryAt != 0) {
+        if (voice.connection() != null || voice.retryPending()) {
             return;
         }
         leave("Connecting…");
         if (!started) {
             return;
         }
-        connectionWanted = true;
+        voice.requestConnection();
         Player player = client.getLocalPlayer();
         if (client.getGameState() != GameState.LOGGED_IN || player == null) {
             status("Waiting for login");
@@ -351,190 +336,77 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         try {
             VoiceConnection.validateEndpoint(relayEndpoint());
         } catch (IllegalArgumentException e) {
-            connectionWanted = false;
+            voice.cancelConnectionRequest();
             status(e.getMessage());
             return;
         }
-        sessionName = VoiceAlias.create();
+        voice.newIdentity();
         if (panel != null) {
-            panel.alias(sessionName);
+            panel.alias(voice.alias());
             panel.connectionActive(true);
         }
         openConnection();
     }
 
     private void openConnection() {
-        retryAt = 0;
-        // Callbacks from an old connection must never stop or feed a newer audio session.
-        VoiceConnection[] owner = new VoiceConnection[1];
-        VoiceConnection next =
-                new VoiceConnection(
-                        gson,
-                        sessionName,
-                        message ->
-                                clientThread.invokeLater(
-                                        () -> {
-                                            if (connection == owner[0]) {
-                                                if (panel != null) {
-                                                    panel.connected(owner[0].isOpen());
-                                                }
-                                                status(message);
-                                            }
-                                        }),
-                        roster ->
-                                pendingRoster.set(
-                                        () -> {
-                                            if (connection != owner[0]) {
-                                                return;
-                                            }
-                                            for (VoiceConnection.Peer previous : peers) {
-                                                if (roster.stream()
-                                                                .noneMatch(p -> p.id == previous.id)
-                                                        && audio != null) {
-                                                    audio.block(previous.id);
-                                                }
-                                            }
-                                            peers = roster;
-                                            refreshPeers();
-                                            updateListening();
-                                            if (held) {
-                                                captureStatus(owner[0]);
-                                            } else if (roster.isEmpty()) {
-                                                status("No other voices");
-                                            } else if (!owner[0].canTransmit()) {
-                                                status("No listeners available");
-                                            } else if (!held) {
-                                                status(
-                                                        config.voiceMode() == VoiceMode.PUSH_TO_TALK
-                                                                ? "Connected — hold push-to-talk to"
-                                                                        + " speak"
-                                                                : "Connected — voice-activated"
-                                                                        + " mode");
-                                            }
-                                        }),
-                        packet -> {
-                            AudioEngine current = audio;
-                            if (connection == owner[0]
-                                    && current != null
-                                    && eligible
-                                    && System.nanoTime() - eligibleAt < 2_500_000_000L) {
-                                current.receive(packet);
-                            }
-                        },
-                        reason ->
-                                clientThread.invokeLater(() -> onConnectionEnded(owner[0], reason)),
-                        observer);
-        owner[0] = next;
-        next.roomListener(
-                state -> {
-                    if (connection != next) {
-                        return;
+        VoiceConnection next = voice.open(gson, observer, new VoiceClient.Listener() {
+            @Override
+            public void status(VoiceConnection source, String message) {
+                clientThread.invokeLater(() -> {
+                    if (voice.owns(source)) {
+                        if (panel != null) {
+                            panel.connected(source.isOpen());
+                        }
+                        RsVcPlugin.this.status(message);
                     }
-                    boolean resetAudio =
-                            !sessionRoom.equals(state.code)
-                                    || "expired".equals(state.reason)
-                                    || "unavailable".equals(state.reason);
-                    AudioEngine currentAudio = audio;
-                    if (resetAudio && currentAudio != null) {
-                        currentAudio.clearPlayback();
+                });
+            }
+
+            @Override
+            public void roster(VoiceConnection source, List<VoiceConnection.Peer> roster) {
+                pendingRoster.set(() -> applyRoster(source, roster));
+            }
+
+            @Override
+            public void audio(VoiceConnection source, VoicePacket packet) {
+                AudioEngine current = audio;
+                if (voice.owns(source) && current != null && voice.audioAllowed()) {
+                    current.receive(packet);
+                }
+            }
+
+            @Override
+            public void ended(VoiceConnection source, DisconnectReason reason) {
+                clientThread.invokeLater(() -> onConnectionEnded(source, reason));
+            }
+
+            @Override
+            public void room(VoiceConnection source, VoiceConnection.RoomState state) {
+                if (!voice.owns(source)) {
+                    return;
+                }
+                AudioEngine current = audio;
+                if (current != null && (!voice.roomCode().equals(state.code)
+                        || "expired".equals(state.reason) || "unavailable".equals(state.reason))) {
+                    current.clearPlayback();
+                }
+                clientThread.invokeLater(() -> applyRoom(source, state));
+            }
+        });
+        audio = new AudioEngine(
+                config.microphone(), config.speakers(),
+                () -> Math.max(0, Math.min(100, config.volume())),
+                packet -> {
+                    if (voice.owns(next) && held && !muted && !deaf && voice.audioAllowed()) {
+                        next.transmit(packet);
                     }
-                    // Close the audio gate immediately for an actual room transition.
-                    // Membership updates within the accepted room must not deafen us.
-                    if (partyVoiceSelected
-                            && (!"updated".equals(state.reason)
-                                    || !sessionRoom.equals(state.code))) {
-                        next.requireRoom("");
-                    }
-                    clientThread.invokeLater(
-                            () -> {
-                                if (connection != next) {
-                                    return;
-                                }
-                                boolean changed = !sessionRoom.equals(state.code);
-                                if (state.restorationFailed) {
-                                    release();
-                                    sessionRoom = next.recoveryRoomCode();
-                                    roomRecoveryPaused = true;
-                                    if (panel != null) {
-                                        panel.roomState(state.code, false);
-                                        panel.roomRecovery(true);
-                                    }
-                                    status("Voice paused — room " + state.reason + "; retry room or return to nearby");
-                                    return;
-                                }
-                                roomRecoveryPaused = next.roomRecoveryPaused();
-                                sessionRoom = roomRecoveryPaused ? next.recoveryRoomCode() : state.code;
-                                if (panel != null) {
-                                    panel.roomRecovery(roomRecoveryPaused);
-                                }
-                                if ("full".equals(state.reason)) {
-                                    boolean party = partyVoiceSelected;
-                                    stopPartyVoice();
-                                    next.requireRoom(null);
-                                    updatePartyVoice();
-                                    if (panel != null) {
-                                        panel.roomState(state.code, false);
-                                        panel.roomFull(party);
-                                    }
-                                    status(
-                                            party
-                                                    ? "Party voice room full — try again later"
-                                                    : "Room full — try again later");
-                                    return;
-                                }
-                                // Capture intent is client-thread-owned, like onClientTick.
-                                if (changed
-                                        || "expired".equals(state.reason)
-                                        || "unavailable".equals(state.reason)) {
-                                    release();
-                                }
-                                if (partyVoiceSelected) {
-                                    partyVoice.roomChanged(
-                                            state.code, state.reason, monotonicMillis());
-                                    updatePartyVoice();
-                                    return;
-                                }
-                                if (panel != null) {
-                                    panel.roomState(state.code, "created".equals(state.reason));
-                                }
-                                if ("expired".equals(state.reason)) {
-                                    status("Room expired");
-                                } else if ("unavailable".equals(state.reason)) {
-                                    status("Room unavailable — current voice selection unchanged");
-                                } else if ("created".equals(state.reason)) {
-                                    status("Room created — Room → Invite code");
-                                }
-                            });
                 },
-                partyVoiceSelected ? "" : sessionRoom,
-                !partyVoiceSelected && roomRecoveryPaused);
-        next.requireRoom(partyVoiceSelected ? "" : null);
-        connection = next;
-        audio =
-                new AudioEngine(
-                        config.microphone(),
-                        config.speakers(),
-                        () -> Math.max(0, Math.min(100, config.volume())),
-                        packet -> {
-                            if (connection == next
-                                    && held
-                                    && !muted
-                                    && !deaf
-                                    && eligible
-                                    && System.nanoTime() - eligibleAt < 2_500_000_000L) {
-                                next.transmit(packet);
-                            }
-                        },
-                        next::canTransmit,
-                        message ->
-                                clientThread.invokeLater(
-                                        () -> {
-                                            if (connection == next) {
-                                                leave(message);
-                                            }
-                                        }),
-                        true,
-                        observer);
+                next::canTransmit,
+                message -> clientThread.invokeLater(() -> {
+                    if (voice.owns(next)) {
+                        leave(message);
+                    }
+                }), true, observer);
         audio.deafen(deaf);
         updateListening();
         try {
@@ -544,20 +416,86 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         }
     }
 
-    private void onConnectionEnded(VoiceConnection source, DisconnectReason reason) {
-        if (connection != source) {
+    private void applyRoster(VoiceConnection source, List<VoiceConnection.Peer> roster) {
+        if (!voice.owns(source)) {
             return;
         }
-        if (!partyVoiceSelected) {
-            roomRecoveryPaused = source.roomRecoveryPaused();
-            if (!source.recoveryRoomCode().isEmpty()) {
-                sessionRoom = source.recoveryRoomCode();
+        for (VoiceConnection.Peer previous : peers) {
+            if (roster.stream().noneMatch(p -> p.id == previous.id) && audio != null) {
+                audio.block(previous.id);
             }
         }
-        connection = null;
-        if (partyVoiceSelected) {
+        peers = roster;
+        refreshPeers();
+        updateListening();
+        if (held) {
+            captureStatus(source);
+        } else if (roster.isEmpty()) {
+            status("No other voices");
+        } else if (!source.canTransmit()) {
+            status("No listeners available");
+        } else {
+            status(config.voiceMode() == VoiceMode.PUSH_TO_TALK
+                    ? "Connected — hold push-to-talk to speak" : "Connected — voice-activated mode");
+        }
+    }
+
+    private void applyRoom(VoiceConnection source, VoiceConnection.RoomState state) {
+        boolean changed = !voice.roomCode().equals(state.code);
+        if (!voice.acceptRoom(source, state)) {
+            return;
+        }
+        if (state.restorationFailed) {
+            release();
+            if (panel != null) {
+                panel.roomState(state.code, false);
+                panel.roomRecovery(true);
+            }
+            status("Voice paused — room " + state.reason + "; retry room or return to nearby");
+            return;
+        }
+        if (panel != null) {
+            panel.roomRecovery(voice.recoveryPaused());
+        }
+        if ("full".equals(state.reason)) {
+            boolean party = voice.partySelected();
+            stopPartyVoice();
+            source.requireRoom(null);
+            updatePartyVoice();
+            if (panel != null) {
+                panel.roomState(state.code, false);
+                panel.roomFull(party);
+            }
+            status(party ? "Party voice room full — try again later" : "Room full — try again later");
+            return;
+        }
+        if (changed || "expired".equals(state.reason) || "unavailable".equals(state.reason)) {
+            release();
+        }
+        if (voice.partySelected()) {
+            partyVoice.roomChanged(state.code, state.reason, monotonicMillis());
+            updatePartyVoice();
+            return;
+        }
+        if (panel != null) {
+            panel.roomState(state.code, "created".equals(state.reason));
+        }
+        if ("expired".equals(state.reason)) {
+            status("Room expired");
+        } else if ("unavailable".equals(state.reason)) {
+            status("Room unavailable — current voice selection unchanged");
+        } else if ("created".equals(state.reason)) {
+            status("Room created — Room → Invite code");
+        }
+    }
+
+    private void onConnectionEnded(VoiceConnection source, DisconnectReason reason) {
+        Long delay = voice.disconnected(source, reason);
+        if (delay == null) {
+            return;
+        }
+        if (voice.partySelected()) {
             partyVoice.reconnect();
-            sessionRoom = "";
         }
         stopAudio();
         visiblePlayers.clear();
@@ -568,14 +506,10 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             panel.roomsEnabled(false);
             panel.connected(false);
         }
-        long delay = reconnect.nextDelayMillis(reason);
-        log.debug(
-                "RSVC reconnect: relay={}, category={}, partySelected={}, retryDelayMs={}",
-                localTesting ? "local" : "hosted", reason, partyVoiceSelected, delay);
+        log.debug("RSVC reconnect: relay={}, category={}, partySelected={}, retryDelayMs={}",
+                localTesting ? "local" : "hosted", reason, voice.partySelected(), delay);
         if (delay < 0) {
             stopPartyVoice();
-            connectionWanted = false;
-            sessionName = "";
             if (panel != null) {
                 panel.alias("");
                 panel.connectionActive(false);
@@ -584,9 +518,8 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             return;
         }
         if (reason == DisconnectReason.ALIAS_IN_USE) {
-            sessionName = VoiceAlias.replacement(sessionName);
             if (panel != null) {
-                panel.alias(sessionName);
+                panel.alias(voice.alias());
             }
             status("Alias was taken — retrying with a new random alias");
         } else if (reason == DisconnectReason.IDENTITY_IN_USE) {
@@ -594,13 +527,10 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         } else if (reason == DisconnectReason.SERVER_FULL) {
             status("Voice server full — retrying automatically in " + delay / 1000 + " seconds");
         } else {
-            status(
-                    localTesting
-                            ? "Local relay interrupted — start it or turn off local testing"
-                            : "Voice interrupted — reconnecting shortly; release push-to-talk");
+            status(localTesting
+                    ? "Local relay interrupted — start it or turn off local testing"
+                    : "Voice interrupted — reconnecting shortly; release push-to-talk");
         }
-        long jitter = java.util.concurrent.ThreadLocalRandom.current().nextLong(500);
-        retryAt = System.nanoTime() + (delay + jitter) * 1_000_000;
     }
 
     private String relayEndpoint() {
@@ -621,8 +551,8 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     /** Attach/detach optional tooling on the client thread; no counters exist in the plugin. */
     public boolean observe(VoiceObserver next) {
         observer = started ? java.util.Objects.requireNonNull(next) : VoiceObserver.NONE;
-        if (connection != null) {
-            connection.observer(observer);
+        if (voice.connection() != null) {
+            voice.connection().observer(observer);
         } else {
             observer.connected(false);
         }
@@ -663,11 +593,10 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void stopAudio() {
-        gameSession.invalidatePosition();
         endLocalAudioTest();
         matchedPlayers.clear();
         speakingPlayers = Collections.emptyList();
-        eligible = false;
+        voice.invalidateAudio();
         release();
         AudioEngine current = audio;
         audio = null;
@@ -682,25 +611,13 @@ public class RsVcPlugin extends Plugin implements KeyListener {
 
     private void leave(String message) {
         stopPartyVoice();
-        connectionWanted = false;
-        VoiceConnection current = connection;
-        connection = null;
-        if (current != null) {
-            current.close();
-        }
+        voice.disconnect();
         stopAudio();
         blocked.clear();
         status(message);
         mutedNames.clear();
         speakerVolumes.clear();
         peers = Collections.emptyList();
-        sessionName = "";
-        sessionRoom = "";
-        roomRecoveryPaused = false;
-        sessionCharacter = identitySalt = identityToken = "";
-        sessionWorld = 0;
-        retryAt = 0;
-        reconnect.reset();
         visiblePlayers.clear();
         trackedView = null;
         matcher.clear();
@@ -715,34 +632,31 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void restartConnection(String message) {
-        boolean resume = connectionWanted;
+        boolean resume = voice.connectionWanted();
         leave(message);
-        connectionWanted = resume;
+        if (resume) {
+            voice.requestConnection();
+        }
     }
 
     private void awaitLogin() {
-        restartConnection(connectionWanted ? "Waiting for login" : "Disconnected");
+        restartConnection(voice.connectionWanted() ? "Waiting for login" : "Disconnected");
     }
 
     @Subscribe
     public void onGameTick(GameTick tick) {
-        gameSession.state(client.getGameState());
-        if (started
-                && connectionWanted
-                && connection == null
-                && retryAt == 0
-                && client.getGameState() == GameState.LOGGED_IN) {
-            join();
-        }
-        if (retryAt != 0) {
-            if (!started || gameSession.ended()) {
+        switch (voice.tick(voiceGameState(client.getGameState()), started)) {
+            case JOIN:
+                join();
+                break;
+            case RECONNECT:
+                openConnection();
+                break;
+            case WAIT_FOR_LOGIN:
                 awaitLogin();
                 return;
-            }
-            if (client.getGameState() == GameState.LOGGED_IN
-                    && System.nanoTime() >= retryAt) {
-                openConnection();
-            }
+            default:
+                break;
         }
         updateProximity();
         updatePartyVoice();
@@ -756,11 +670,11 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         if (!started) {
             return;
         }
-        if (partyVoiceSelected) {
+        if (voice.partySelected()) {
             leavePartyVoice("Left party voice — nearby voice");
             return;
         }
-        VoiceConnection current = connection;
+        VoiceConnection current = voice.connection();
         if (!partyService.isInParty()
                 || partyService.getLocalMember() == null
                 || current == null
@@ -773,8 +687,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                 partyService.getLocalMember().getMemberId(),
                 localTesting,
                 monotonicMillis());
-        partyVoiceSelected = true;
-        roomRecoveryPaused = false;
+        voice.selectParty();
         if (panel != null) {
             panel.roomRecovery(false);
         }
@@ -801,21 +714,17 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void recoverRoom(boolean retry) {
-        VoiceConnection current = connection;
-        if (!started || partyVoiceSelected || current == null) {
+        VoiceConnection current = voice.connection();
+        if (!started || voice.partySelected() || current == null) {
             return;
         }
-        boolean accepted = retry ? current.retryRoomRecovery() : current.returnToNearbyVoice();
+        boolean accepted = voice.recoverRoom(retry);
         if (!accepted) {
             return;
         }
         release();
         if (audio != null) {
             audio.clearPlayback();
-        }
-        roomRecoveryPaused = false;
-        if (!retry) {
-            sessionRoom = "";
         }
         if (panel != null) {
             panel.roomRecovery(false);
@@ -840,18 +749,20 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void leavePartyVoice(String message) {
-        boolean resume = connectionWanted;
+        boolean resume = voice.connectionWanted();
         // Closing cancels any in-flight room creation/join before returning to nearby voice.
         leave(message);
-        connectionWanted = resume;
+        if (resume) {
+            voice.requestConnection();
+        }
     }
 
     private void stopPartyVoice() {
-        if (!partyVoiceSelected) {
+        if (!voice.partySelected()) {
             return;
         }
         boolean notify = partyVoice.sameParty(partyService.getPartyId());
-        partyVoiceSelected = false;
+        voice.stopParty();
         partyVoice.stop();
         if (notify) {
             sendPartyVoice();
@@ -873,13 +784,13 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         if (!started) {
             return;
         }
-        VoiceConnection current = connection;
+        VoiceConnection current = voice.connection();
         boolean inParty = partyService.isInParty() && partyService.getLocalMember() != null;
-        if (partyVoiceSelected && !partyVoice.sameParty(partyService.getPartyId())) {
+        if (voice.partySelected() && !partyVoice.sameParty(partyService.getPartyId())) {
             leavePartyVoice("Party changed — nearby voice");
             return;
         }
-        if (partyVoiceSelected) {
+        if (voice.partySelected()) {
             long now = monotonicMillis();
             Set<Long> members = new HashSet<>();
             partyService.getMembers().forEach(member -> members.add(member.getMemberId()));
@@ -909,8 +820,8 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             panel.roomsEnabled(current != null && current.roomsAvailable());
             panel.partyState(
                     inParty,
-                    partyVoiceSelected,
-                    partyVoiceSelected
+                    voice.partySelected(),
+                    voice.partySelected()
                             && inParty
                             && current != null
                             && !partyVoice.requiredRoom().isEmpty()
@@ -920,14 +831,14 @@ public class RsVcPlugin extends Plugin implements KeyListener {
 
     @Subscribe
     public void onPartyChanged(PartyChanged event) {
-        if (partyVoiceSelected) {
-            VoiceConnection current = connection;
+        if (voice.partySelected()) {
+            VoiceConnection current = voice.connection();
             if (current != null) {
                 current.requireRoom("");
             }
             clientThread.invokeLater(
                     () -> {
-                        if (started && partyVoiceSelected) {
+                        if (started && voice.partySelected()) {
                             leavePartyVoice("Party changed — nearby voice");
                         }
                     });
@@ -939,7 +850,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         clientThread.invokeLater(
                 () -> {
                     if (!started
-                            || !partyVoiceSelected
+                            || !voice.partySelected()
                             || !partyVoice.sameParty(partyService.getPartyId())
                             || partyService.getMemberById(event.getMemberId()) == null) {
                         return;
@@ -953,7 +864,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     public void onUserSync(UserSync event) {
         clientThread.invokeLater(
                 () -> {
-                    if (started && partyVoiceSelected) {
+                    if (started && voice.partySelected()) {
                         partyVoice.requestAdvertisement();
                     }
                 });
@@ -961,7 +872,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
 
     @Subscribe
     public void onPlayerSpawned(PlayerSpawned event) {
-        if (connection != null) {
+        if (voice.connection() != null) {
             visiblePlayers.add(event.getPlayer());
         }
     }
@@ -973,7 +884,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void updateProximity() {
-        VoiceConnection current = connection;
+        VoiceConnection current = voice.connection();
         Player self = client.getLocalPlayer();
         if (current == null || client.getGameState() != GameState.LOGGED_IN || self == null) {
             return;
@@ -1030,21 +941,8 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                             nearby.add(id);
                         }
                     });
-            String ownToken = VoiceIdentity.token(salt, self.getName(), client.getWorld());
-            String ownRegion = VoiceIdentity.region(
-                    salt, client.getWorld(), origin.getRegionID(), origin.getPlane());
-            sessionCharacter = self.getName();
-            sessionWorld = client.getWorld();
-            identitySalt = salt;
-            identityToken = ownToken;
-            eligible = true;
-            eligibleAt = System.nanoTime();
-            gameSession.positionUpdated(eligibleAt);
-            current.proximity(
-                    salt,
-                    ownToken,
-                    nearby,
-                    ownRegion);
+            voice.position(salt, self.getName(), client.getWorld(), nearby,
+                    origin.getRegionID(), origin.getPlane());
             if (!current.inRoom()) {
                 for (VoiceConnection.Peer peer : peers) {
                     if (!nearby.contains(peer.id) && audio != null) {
@@ -1070,7 +968,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             rosterUpdate.run();
         }
         updateSpeakingIndicators();
-        VoiceConnection current = connection;
+        VoiceConnection current = voice.connection();
         if (current == null) {
             return;
         }
@@ -1078,12 +976,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             leave("Disconnected");
             return;
         }
-        current.selfStatus(muted, deaf);
-        current.heartbeat();
-        current.checkHealth();
-        if (current.isStable()) {
-            reconnect.reset();
-        }
+        voice.heartbeat(muted, deaf);
         if (config.voiceMode() == VoiceMode.VOICE_ACTIVATED) {
             if (canCapture(current)) {
                 if (!held) {
@@ -1107,7 +1000,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                         : focused)
                 && !muted
                 && !deaf
-                && eligible
+                && voice.eligible()
                 && audio != null
                 && current != null
                 && current.isOpen()
@@ -1120,16 +1013,10 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void pause(String reason) {
-        gameSession.invalidatePosition();
-        eligible = false;
-        eligibleAt = 0;
+        voice.pause();
         release();
         if (audio != null) {
             audio.clearPlayback();
-        }
-        VoiceConnection current = connection;
-        if (current != null) {
-            current.proximity(current.matchingSalt(), "", Collections.emptySet());
         }
         visiblePlayers.clear();
         matchedPlayers.clear();
@@ -1156,7 +1043,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         }
         blocked.clear();
         blocked.addAll(nextBlocked);
-        VoiceConnection current = connection;
+        VoiceConnection current = voice.connection();
         if (current != null) {
             current.mutedAliases(quiet);
             current.listening(deaf, blocked);
@@ -1184,40 +1071,39 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void handleGameState(GameState state) {
-        gameSession.state(state);
-        if (gameSession.ended()) {
-            if (connection != null || retryAt != 0) {
-                awaitLogin();
+        boolean wasEligible = voice.eligible();
+        VoiceClient.GameUpdate update = voice.gameState(
+                voiceGameState(state), state == GameState.LOGGED_IN && client.getLocalPlayer() != null);
+        if (update == VoiceClient.GameUpdate.LOGGED_OUT) {
+            awaitLogin();
+        } else if (update == VoiceClient.GameUpdate.POSITION_UNAVAILABLE) {
+            if (wasEligible && !voice.eligible()) {
+                release();
+                if (audio != null) {
+                    audio.clearPlayback();
+                }
+                status("Nearby voice paused — waiting for position updates");
             }
-            return;
+            visiblePlayers.clear();
+            matchedPlayers.clear();
+            speakingPlayers = Collections.emptyList();
+            trackedView = null;
+            matcher.clear();
         }
-        VoiceConnection current = connection;
-        if (current == null
-                || (gameSession.hasFreshPosition(System.nanoTime())
-                        && client.getLocalPlayer() != null)) {
-            return;
+    }
+
+    static VoiceClient.GameState voiceGameState(GameState state) {
+        switch (state) {
+            case LOGGED_IN:
+                return VoiceClient.GameState.LOGGED_IN;
+            case LOADING:
+            case HOPPING:
+            case CONNECTION_LOST:
+            case LOGGING_IN:
+                return VoiceClient.GameState.TRANSITION;
+            default:
+                return VoiceClient.GameState.LOGGED_OUT;
         }
-        // No player/world reads during transitions. The accepted room remains authoritative.
-        String salt = current.matchingSalt();
-        if (!salt.isEmpty() && !sessionCharacter.isEmpty() && !salt.equals(identitySalt)) {
-            identityToken = VoiceIdentity.token(salt, sessionCharacter, sessionWorld);
-            identitySalt = salt;
-        }
-        boolean roomActive = current.suspendProximity(identitySalt, identityToken);
-        if (eligible && !roomActive) {
-            release();
-            if (audio != null) {
-                audio.clearPlayback();
-            }
-            status("Nearby voice paused — waiting for position updates");
-        }
-        eligible = roomActive;
-        eligibleAt = roomActive ? System.nanoTime() : 0;
-        visiblePlayers.clear();
-        matchedPlayers.clear();
-        speakingPlayers = Collections.emptyList();
-        trackedView = null;
-        matcher.clear();
     }
 
     @Subscribe
@@ -1286,7 +1172,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         }
         keyDown = true;
         AudioEngine current = audio;
-        VoiceConnection network = connection;
+        VoiceConnection network = voice.connection();
         if (!held && canCapture(network)) {
             held = true;
             current.startCapture();
@@ -1337,7 +1223,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         List<Player> active = new ArrayList<>();
         BooleanSupplier testSpeaking = localTestSpeaking;
         AudioEngine current = audio;
-        boolean live = eligible && now - eligibleAt < 2_500_000_000L;
+        boolean live = voice.audioAllowed();
         if ((testSpeaking != null && testSpeaking.getAsBoolean())
                 || (live
                         && current != null
