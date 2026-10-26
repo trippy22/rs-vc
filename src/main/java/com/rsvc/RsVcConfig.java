@@ -61,6 +61,24 @@ public interface RsVcConfig extends Config {
         return new Keybind(KeyEvent.VK_V, KeyEvent.CTRL_DOWN_MASK);
     }
 
+    @ConfigItem(
+            keyName = "muteHotkey",
+            name = "Toggle mic mute",
+            position = 10,
+            description = "Toggle microphone mute while the game has focus. Works in either voice mode.")
+    default Keybind muteHotkey() {
+        return new Keybind(KeyEvent.VK_F8, 0);
+    }
+
+    @ConfigItem(
+            keyName = "deafenHotkey",
+            name = "Toggle deafen",
+            position = 11,
+            description = "Toggle incoming voice and microphone mute while the game has focus. Works in either voice mode.")
+    default Keybind deafenHotkey() {
+        return new Keybind(KeyEvent.VK_F9, 0);
+    }
+
     @Range(min = 0, max = 100)
     @ConfigItem(
             keyName = "volume",

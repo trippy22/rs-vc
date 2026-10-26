@@ -61,6 +61,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     private boolean roomsSupported, roomPending;
     private volatile String roomCode = "";
     private String resumeRoom = "";
+    private String requiredRoom;
     private Consumer<RoomState> roomListener = state -> {};
 
     private Set<Long> nearby = Collections.emptySet();
@@ -95,6 +96,20 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
 
     public boolean inRoom() {
         return !roomCode.isEmpty();
+    }
+
+    public String roomCode() {
+        return roomCode;
+    }
+
+    /** Null is ordinary voice; empty blocks all audio while party discovery is in progress. */
+    public synchronized void requireRoom(String code) {
+        requiredRoom = code;
+        sendState();
+    }
+
+    private boolean scopeAllowed() {
+        return requiredRoom == null || (!requiredRoom.isEmpty() && requiredRoom.equals(roomCode));
     }
 
     public synchronized boolean roomsAvailable() {
@@ -396,7 +411,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     }
 
     private boolean canReceive() {
-        return activeConnection() && !deaf && !roomPending;
+        return activeConnection() && !deaf && !roomPending && scopeAllowed();
     }
 
     public synchronized boolean canTransmit() {
@@ -507,10 +522,12 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         if (keyEpoch != 0) {
             msg.addProperty("keyEpoch", keyEpoch);
         }
-        msg.addProperty("deaf", deaf);
+        msg.addProperty("deaf", deaf || !scopeAllowed());
         JsonArray near = new JsonArray();
-        for (long id : new java.util.TreeSet<>(nearby)) {
-            near.add(id);
+        if (requiredRoom == null) {
+            for (long id : new java.util.TreeSet<>(nearby)) {
+                near.add(id);
+            }
         }
         msg.add("near", near);
         JsonArray list = new JsonArray();

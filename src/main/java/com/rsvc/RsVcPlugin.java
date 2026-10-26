@@ -6,6 +6,8 @@ import com.rsvc.audio.AudioEngine;
 import com.rsvc.network.DisconnectReason;
 import com.rsvc.network.ReconnectPolicy;
 import com.rsvc.network.VoiceConnection;
+import com.rsvc.party.PartyVoice;
+import com.rsvc.party.RsVcPartyVoice;
 import com.rsvc.proximity.ProximityMatcher;
 import com.rsvc.proximity.VoiceAlias;
 import com.rsvc.proximity.VoiceIdentity;
@@ -29,13 +31,18 @@ import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.PartyChanged;
 import net.runelite.client.input.KeyListener;
 import net.runelite.client.input.KeyManager;
+import net.runelite.client.party.PartyService;
+import net.runelite.client.party.WSClient;
+import net.runelite.client.party.messages.UserSync;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.HotkeyListener;
 
 import okhttp3.OkHttpClient;
 
@@ -71,6 +78,11 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     @Inject private ClientToolbar toolbar;
     @Inject private ConfigManager configManager;
     @Inject private OverlayManager overlayManager;
+    @Inject private PartyService partyService;
+    @Inject private WSClient partySocket;
+
+    private final PartyVoice partyVoice = new PartyVoice();
+    private volatile boolean partyVoiceSelected;
 
     private VoicePanel panel;
     private VoiceObserver observer = VoiceObserver.NONE;
@@ -109,6 +121,18 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             Collections.newSetFromMap(new java.util.IdentityHashMap<>());
     private final ProximityMatcher matcher = new ProximityMatcher();
     private WorldView trackedView;
+    private final HotkeyListener muteHotkey = new HotkeyListener(() -> config.muteHotkey()) {
+        @Override
+        public void hotkeyPressed() {
+            clientThread.invokeLater(() -> setMicrophoneMuted(!muted));
+        }
+    };
+    private final HotkeyListener deafenHotkey = new HotkeyListener(() -> config.deafenHotkey()) {
+        @Override
+        public void hotkeyPressed() {
+            clientThread.invokeLater(() -> setDeafened(!deaf));
+        }
+    };
 
     @Provides
     RsVcConfig provideConfig(ConfigManager manager) {
@@ -117,6 +141,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
 
     @Override
     protected void startUp() {
+        partySocket.registerMessage(RsVcPartyVoice.class);
         muted = false;
         deaf = false;
         held = false;
@@ -160,21 +185,9 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                                     () -> clientThread.invokeLater(this::join),
                                     () -> clientThread.invokeLater(() -> leave("Disconnected")),
                                     value ->
-                                            clientThread.invokeLater(
-                                                    () -> {
-                                                        muted = value;
-                                                        release();
-                                                    }),
+                                            clientThread.invokeLater(() -> setMicrophoneMuted(value)),
                                     value ->
-                                            clientThread.invokeLater(
-                                                    () -> {
-                                                        deaf = value;
-                                                        release();
-                                                        if (audio != null) {
-                                                            audio.deafen(value);
-                                                        }
-                                                        updateListening();
-                                                    }),
+                                            clientThread.invokeLater(() -> setDeafened(value)),
                                     (id, value) ->
                                             clientThread.invokeLater(
                                                     () -> {
@@ -221,6 +234,9 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                             (action, code) ->
                                     clientThread.invokeLater(
                                             () -> {
+                                                if (partyVoiceSelected) {
+                                                    return;
+                                                }
                                                 VoiceConnection current = connection;
                                                 if (current == null || !current.roomsAvailable()) {
                                                     status("Connect and log in before using rooms");
@@ -232,6 +248,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                                                 }
                                                 current.room(action, code);
                                             }));
+                    panel.partyAction(() -> clientThread.invokeLater(this::togglePartyVoice));
                     BufferedImage icon = new BufferedImage(24, 24, BufferedImage.TYPE_INT_ARGB);
                     Graphics2D g = icon.createGraphics();
                     g.setColor(new Color(85, 200, 160));
@@ -254,6 +271,9 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                                 }
                             });
                 });
+        // Toggle keys take precedence over PTT if the user assigns the same key.
+        keyManager.registerKeyListener(muteHotkey);
+        keyManager.registerKeyListener(deafenHotkey);
         keyManager.registerKeyListener(this);
         speakingOverlay = new SpeakingOverlay(client, () -> speakingPlayers);
         overlayManager.add(speakingOverlay);
@@ -268,9 +288,14 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             focus.close();
         }
         leave("Disconnected");
+        partySocket.unregisterMessage(RsVcPartyVoice.class);
         observer = VoiceObserver.NONE;
         overlayManager.remove(speakingOverlay);
         keyManager.unregisterKeyListener(this);
+        keyManager.unregisterKeyListener(muteHotkey);
+        keyManager.unregisterKeyListener(deafenHotkey);
+        muteHotkey.focusLost();
+        deafenHotkey.focusLost();
         devicePicker.close();
         SwingUtilities.invokeLater(
                 () -> {
@@ -396,6 +421,21 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                             current.clearPlayback();
                         }
                     }
+                    if (partyVoiceSelected) {
+                        // Keep callbacks from opening nearby/private audio before client-thread
+                        // discovery has accepted this room, including an expired room on reconnect.
+                        next.requireRoom("");
+                        clientThread.invokeLater(
+                                () -> {
+                                    if (connection != next || !partyVoiceSelected) {
+                                        return;
+                                    }
+                                    partyVoice.roomChanged(
+                                            state.code, state.reason, monotonicMillis());
+                                    updatePartyVoice();
+                                });
+                        return;
+                    }
                     if ("expired".equals(state.reason) || "unavailable".equals(state.reason)) {
                         muted = true;
                         if (panel != null) {
@@ -416,7 +456,8 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                         status("Room created — Room → Invite code");
                     }
                 },
-                sessionRoom);
+                partyVoiceSelected ? "" : sessionRoom);
+        next.requireRoom(partyVoiceSelected ? "" : null);
         connection = next;
         audio =
                 new AudioEngine(
@@ -457,6 +498,10 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             return;
         }
         connection = null;
+        if (partyVoiceSelected) {
+            partyVoice.reconnect();
+            sessionRoom = "";
+        }
         stopAudio();
         peers = Collections.emptyList();
         blocked.clear();
@@ -466,6 +511,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         }
         long delay = reconnect.nextDelayMillis(reason);
         if (delay < 0) {
+            stopPartyVoice();
             connectionWanted = false;
             sessionName = "";
             if (panel != null) {
@@ -559,6 +605,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void leave(String message) {
+        stopPartyVoice();
         connectionWanted = false;
         VoiceConnection current = connection;
         connection = null;
@@ -584,11 +631,15 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             panel.connectionActive(false);
             panel.roomState("");
             panel.roomsEnabled(false);
+            panel.partyState(partyService.isInParty(), false, false);
         }
     }
 
     private void restartConnection(String message) {
         boolean resume = connectionWanted;
+        if (partyVoiceSelected) {
+            muteAfterParty();
+        }
         leave(message);
         connectionWanted = resume;
     }
@@ -616,6 +667,199 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             }
         }
         updateProximity();
+        updatePartyVoice();
+    }
+
+    private static long monotonicMillis() {
+        return System.nanoTime() / 1_000_000L;
+    }
+
+    private void togglePartyVoice() {
+        if (!started) {
+            return;
+        }
+        if (partyVoiceSelected) {
+            leavePartyVoice("Left party voice — nearby voice; microphone muted");
+            return;
+        }
+        VoiceConnection current = connection;
+        if (!partyService.isInParty()
+                || partyService.getLocalMember() == null
+                || current == null
+                || !current.roomsAvailable()) {
+            status("Connect voice and join a RuneLite party first");
+            return;
+        }
+        partyVoice.start(
+                partyService.getPartyId(),
+                partyService.getLocalMember().getMemberId(),
+                config.localTesting(),
+                monotonicMillis());
+        partyVoiceSelected = true;
+        current.requireRoom("");
+        release();
+        if (audio != null) {
+            audio.clearPlayback();
+        }
+        peers = Collections.emptyList();
+        refreshPeers();
+        updatePartyVoice();
+        status("Joining party voice");
+    }
+
+    private void muteAfterParty() {
+        muted = true;
+        release();
+        if (panel != null) {
+            panel.microphoneMuted(true);
+        }
+    }
+
+    private void setMicrophoneMuted(boolean value) {
+        if (!started) {
+            return;
+        }
+        muted = value;
+        release();
+        if (panel != null) {
+            panel.microphoneMuted(value);
+        }
+    }
+
+    private void setDeafened(boolean value) {
+        if (!started) {
+            return;
+        }
+        deaf = value;
+        release();
+        if (audio != null) {
+            audio.deafen(value);
+        }
+        updateListening();
+        if (panel != null) {
+            panel.deafened(value);
+        }
+    }
+
+    private void leavePartyVoice(String message) {
+        boolean resume = connectionWanted;
+        muteAfterParty();
+        // Closing cancels any in-flight room creation/join before returning to nearby voice.
+        leave(message);
+        connectionWanted = resume;
+    }
+
+    private void stopPartyVoice() {
+        if (!partyVoiceSelected) {
+            return;
+        }
+        boolean notify = partyVoice.sameParty(partyService.getPartyId());
+        partyVoiceSelected = false;
+        partyVoice.stop();
+        if (notify) {
+            sendPartyVoice();
+        }
+    }
+
+    private void sendPartyVoice() {
+        if (!partyService.isInParty() || partyService.getLocalMember() == null) {
+            return;
+        }
+        try {
+            partyService.send(partyVoice.message());
+        } catch (IllegalStateException disconnected) {
+            // RuneLite may close its party socket concurrently. Periodic discovery retries.
+        }
+    }
+
+    private void updatePartyVoice() {
+        if (!started) {
+            return;
+        }
+        VoiceConnection current = connection;
+        boolean inParty = partyService.isInParty() && partyService.getLocalMember() != null;
+        if (partyVoiceSelected && !partyVoice.sameParty(partyService.getPartyId())) {
+            leavePartyVoice("Party changed — nearby voice; microphone muted");
+            return;
+        }
+        if (partyVoiceSelected) {
+            long now = monotonicMillis();
+            Set<Long> members = new HashSet<>();
+            partyService.getMembers().forEach(member -> members.add(member.getMemberId()));
+            partyVoice.retainMembers(members, now);
+            if (inParty && partyVoice.advertisementDue(now)) {
+                sendPartyVoice();
+            }
+            if (current != null) {
+                PartyVoice.Command command =
+                        inParty && current.roomsAvailable()
+                                ? partyVoice.nextCommand(current.roomCode(), now)
+                                : null;
+                String required = inParty ? partyVoice.requiredRoom() : "";
+                current.requireRoom(required);
+                if (required.isEmpty()) {
+                    release();
+                    if (audio != null) {
+                        audio.clearPlayback();
+                    }
+                }
+                if (command != null) {
+                    current.room(command.action, command.code);
+                }
+            }
+        }
+        if (panel != null) {
+            panel.roomsEnabled(current != null && current.roomsAvailable());
+            panel.partyState(
+                    inParty,
+                    partyVoiceSelected,
+                    partyVoiceSelected
+                            && inParty
+                            && current != null
+                            && !partyVoice.requiredRoom().isEmpty()
+                            && partyVoice.requiredRoom().equals(current.roomCode()));
+        }
+    }
+
+    @Subscribe
+    public void onPartyChanged(PartyChanged event) {
+        if (partyVoiceSelected) {
+            VoiceConnection current = connection;
+            if (current != null) {
+                current.requireRoom("");
+            }
+            clientThread.invokeLater(
+                    () -> {
+                        if (started && partyVoiceSelected) {
+                            leavePartyVoice("Party changed — nearby voice; microphone muted");
+                        }
+                    });
+        }
+    }
+
+    @Subscribe
+    public void onRsVcPartyVoice(RsVcPartyVoice event) {
+        clientThread.invokeLater(
+                () -> {
+                    if (!started
+                            || !partyVoiceSelected
+                            || !partyVoice.sameParty(partyService.getPartyId())
+                            || partyService.getMemberById(event.getMemberId()) == null) {
+                        return;
+                    }
+                    partyVoice.receive(event, monotonicMillis());
+                    updatePartyVoice();
+                });
+    }
+
+    @Subscribe
+    public void onUserSync(UserSync event) {
+        clientThread.invokeLater(
+                () -> {
+                    if (started && partyVoiceSelected) {
+                        partyVoice.requestAdvertisement();
+                    }
+                });
     }
 
     @Subscribe
@@ -855,6 +1099,13 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     @Subscribe
     public void onConfigChanged(ConfigChanged event) {
         if (!RsVcConfig.GROUP.equals(event.getGroup())) {
+            return;
+        }
+        if ("muteHotkey".equals(event.getKey()) || "deafenHotkey".equals(event.getKey())) {
+            SwingUtilities.invokeLater(() -> {
+                muteHotkey.focusLost();
+                deafenHotkey.focusLost();
+            });
             return;
         }
         // Retired keys cannot change the fixed destination or grant/revoke a live session.
