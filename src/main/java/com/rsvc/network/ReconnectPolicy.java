@@ -1,12 +1,18 @@
 package com.rsvc.network;
 
-/** Network outages back off indefinitely; policy and repeated identity conflicts stop retries. */
+/** Network and capacity retries back off independently; policy and identity conflicts are bounded. */
 public final class ReconnectPolicy {
     private int failures;
     private int aliasRetries;
     private int networkFailures;
+    private int capacityFailures;
 
     public long nextDelayMillis(DisconnectReason reason) {
+        if (reason == DisconnectReason.SERVER_FULL) {
+            long delay = Math.min(30000, 4000L << capacityFailures);
+            capacityFailures = Math.min(3, capacityFailures + 1);
+            return delay;
+        }
         if (reason == DisconnectReason.NETWORK) {
             long delay = Math.min(30000, 1000L << networkFailures);
             networkFailures = Math.min(5, networkFailures + 1);
@@ -32,5 +38,6 @@ public final class ReconnectPolicy {
         failures = 0;
         aliasRetries = 0;
         networkFailures = 0;
+        capacityFailures = 0;
     }
 }

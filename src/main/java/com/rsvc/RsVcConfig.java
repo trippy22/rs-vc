@@ -27,17 +27,6 @@ public interface RsVcConfig extends Config {
     }
 
     @ConfigItem(
-            keyName = "localTesting",
-            name = "Use local test relay",
-            position = 6,
-            description =
-                    "Use ws://127.0.0.1:8787/v1/voice instead of the hosted relay."
-                            + " Reconnects when changed.")
-    default boolean localTesting() {
-        return false;
-    }
-
-    @ConfigItem(
             keyName = "voiceMode",
             name = "Voice mode",
             position = 8,
@@ -59,6 +48,24 @@ public interface RsVcConfig extends Config {
                             + " listeners.")
     default Keybind pushToTalk() {
         return new Keybind(KeyEvent.VK_V, KeyEvent.CTRL_DOWN_MASK);
+    }
+
+    @ConfigItem(
+            keyName = "muteHotkey",
+            name = "Toggle mic mute",
+            position = 10,
+            description = "Toggle microphone mute while the game has focus. Works in either voice mode.")
+    default Keybind muteHotkey() {
+        return new Keybind(KeyEvent.VK_F8, 0);
+    }
+
+    @ConfigItem(
+            keyName = "deafenHotkey",
+            name = "Toggle deafen",
+            position = 11,
+            description = "Toggle incoming voice and microphone mute while the game has focus. Works in either voice mode.")
+    default Keybind deafenHotkey() {
+        return new Keybind(KeyEvent.VK_F9, 0);
     }
 
     @Range(min = 0, max = 100)

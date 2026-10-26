@@ -1,82 +1,76 @@
 # OSRS Voice Chat
 
-Talk to nearby players in RuneLite, or bring your friends into a private voice room.
-Choose push-to-talk or voice activation, adjust each person's volume, and see who's
-speaking without leaving the game.
+Talk to nearby players, your RuneLite party, or friends in a private voice room.
 
 ![Voice chat sidebar with Connect, Disconnect, microphone controls, Room, Voices and Devices](plugin.png)
 
 ## Get talking
 
-1. Enable **RS Voice Chat** in RuneLite's plugin list and log into Old School RuneScape.
-   Voice connects automatically while the plugin is enabled.
-2. Open the microphone tab in the sidebar. The **green dot** means you're connected;
-   amber means connecting or retrying, and gray means disconnected.
-3. Use **Devices** to choose your microphone and speakers. **Default** uses your
-   system's default device. Headphones help prevent speaker audio feeding back into your mic.
-4. Hold **Ctrl + V** to talk by default. Change the key or choose **Voice-activated**
-   mode in the plugin settings.
+1. Enable **RS Voice Chat** and log in. Voice connects automatically.
+2. Open the microphone sidebar tab. Green means connected, amber means connecting,
+   and gray means disconnected.
+3. Choose your microphone and speakers in **Devices**. Headphones are recommended.
+4. Hold **Ctrl + V** to talk, or choose **Voice-activated** in settings.
 
-**Connect** joins voice again after you disconnect; it is disabled while connecting
-or connected. **Disconnect** stops your voice connection until you reconnect or
-re-enable the plugin.
+Use **Disconnect** to stop voice and **Connect** to rejoin.
 
 ## Nearby voice
 
-In **Nearby · 20 tiles**, you can talk to other connected plugin users within
-20 tiles on the **same world and floor**. Move into range to join the conversation.
+Talk to connected plugin users within **20 tiles**, on the **same world and floor**.
+Nearby voice uses groups of up to **25** in the same map region. Busy regions
+split into separate groups, so you may not hear everyone nearby.
 
-The **Voices** list shows random aliases instead of character names and scrolls
-when more people are nearby. Each person's volume slider and **Mute** button affect
-only what you hear. **Clear mutes** restores muted voices.
-
-A green bubble above a visible player shows when they're speaking. When you're
-alone, your own indicator can still react to your mic, but no audio is uploaded.
+The **Voices** list uses random aliases. Green bubbles show who's speaking.
+When alone, your mic indicator can still react, but no audio is uploaded.
 
 ## Private rooms
 
-Private rooms replace nearby voice. Everyone in the room can talk regardless of
-distance, world or floor, as long as they stay logged in and connected.
+Open **Room** to **Create** a room and share its invite code, or **Join** with a code.
+Use **Invite code** to copy it again and **Leave room** to return to nearby voice.
 
-- **Create:** click **Room → Create**. Your invite code appears immediately;
-  select and copy it to share with your friends.
-- **Join:** click **Room → Join**, paste an invite code, and confirm.
-- **Find your code again:** click **Room → Invite code**.
-- **Return to nearby voice:** click **Room → Leave room**.
+Rooms replace nearby voice and work across distances, worlds and floors while
+you're logged in. Keep codes private: anyone with a valid code can join. Rooms
+close when everyone leaves.
+Private and party rooms hold **25 people**. **Room full** means try joining again
+later; it does not retry automatically.
+If reconnecting cannot restore your private room, voice pauses without changing
+your mic setting. Choose **Retry room** or **Return to nearby** in the sidebar.
 
-Keep invite codes private: anyone with a valid code can join. A room stays open
-while someone remains connected and is deleted when the last person leaves.
-A server restart also clears rooms, so you may need to create a new one.
+## Party voice
+
+Join a party using **Party** or **Hub Party Panel**, then click **Join party voice**.
+Each person needs RS Voice Chat connected and must click to join.
+
+- Replaces nearby voice or your private room; works across worlds and distances.
+- The button becomes **Leave party voice**. Leaving returns to nearby voice and
+  keeps your mute setting.
+- Leaving or switching parties also exits party voice. After logout, click
+  **Join party voice** again.
 
 ## Stay in control
 
-- **Mute mic** stops your microphone.
-- **Deafen** stops both incoming voice and your microphone.
-- **Voice volume** sets overall playback volume; individual sliders let you balance people.
-- **Speaking indicators** toggles the overhead bubbles and local mic detection when alone.
+- **Mute mic / F8:** toggle your microphone mute.
+- **Deafen / F9:** toggle incoming voice and mic mute. Undeafening preserves mic mute.
+- **Voice volume:** adjust everyone, or use individual sliders and **Mute** buttons.
+- **Clear mutes:** unmute other voices.
+- Crossed-out mic/headphone icons show a peer's self-mute/deafen status, with a short delay.
+- **Speaking indicators:** toggle speaking bubbles.
 
-Voice activation follows RuneLite's window, including its sidebar and dialogs.
-Switching to another application pauses microphone capture. Push-to-talk requires
-game focus. Logging out pauses voice until you log back in.
-
-Silence suppression reduces traffic when you aren't speaking. The plugin has no
-recording or audio-export controls. Voice travels through an external relay over
-encrypted connections; it is **not end-to-end encrypted**.
+Hotkeys are configurable and require game focus. Voice activation works while
+RuneLite is focused. Party/private voice continues through loading and world hops;
+nearby voice waits for your new position. Temporary game connection loss preserves
+your room. Logging out disconnects voice.
 
 ## Connection help
 
-For normal use, leave **Use local test relay** **off**. That option is only for
-running a test server on your own computer. If you use the separate development
-helper, disable it when connecting to the hosted service.
-
-If no one appears, check that they also have the plugin enabled and are either
-within nearby range on your world/floor or in the same private room. Check your
-voice mode, microphone selection, mute and deafen controls if you cannot be heard.
-Temporary network failures reconnect automatically.
+Check that everyone is connected and nearby,
+in the same room, or has joined party voice. If you can't be heard, check **Devices**,
+your voice mode, mute and deafen. Temporary network failures reconnect automatically.
+**Voice server full** means all slots are occupied; the plugin retries automatically.
 
 ## Installation warning
 
-> This plugin submits your IP address, RSN, account hash, in-game location, and live microphone audio to a 3rd-party server not controlled or verified by Runelite developers.
+> This plugin submits your IP address and live microphone audio to a 3rd-party server not controlled or verified by Runelite developers.
 
 ## License
 

@@ -12,7 +12,7 @@ import java.util.Set;
 
 /** Bounded protocol-5 directory. Incomplete snapshots never reach proximity matching. */
 final class VoiceDirectory {
-    static final int MAX_MEMBERS = 1000;
+    static final int MAX_MEMBERS = 2000;
     private static final int PAGE_SIZE = 64;
     private long sequence;
     private long revision = -1;

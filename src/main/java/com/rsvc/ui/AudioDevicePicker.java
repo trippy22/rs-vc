@@ -99,7 +99,7 @@ public final class AudioDevicePicker implements AutoCloseable {
         mic.setPreferredSize(new Dimension(360, 26));
         output.setPreferredSize(new Dimension(360, 26));
         JLabel status =
-                new JLabel("Default follows your operating system. Apply disconnects voice.");
+                new JLabel("Default follows your operating system. Apply keeps your voice room.");
         JButton refresh = new JButton("Refresh"),
                 apply = new JButton("Apply"),
                 cancel = new JButton("Cancel");
@@ -146,7 +146,7 @@ public final class AudioDevicePicker implements AutoCloseable {
                                                     refresh.setEnabled(true);
                                                     status.setText(
                                                             "Default follows your operating system."
-                                                                    + " Apply disconnects voice.");
+                                                                    + " Apply keeps your voice room.");
                                                 });
                                     } catch (RuntimeException unavailable) {
                                         SwingUtilities.invokeLater(

@@ -15,6 +15,9 @@ import okhttp3.WebSocketListener;
 
 import okio.ByteString;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -30,13 +33,21 @@ import java.util.function.Consumer;
  * Callbacks run on the invoking thread and must dispatch game/UI work to the appropriate thread.
  */
 public final class VoiceConnection extends WebSocketListener implements AutoCloseable {
+    private static final Logger log = LoggerFactory.getLogger(VoiceConnection.class);
     public static final class Peer {
         public final long id;
         public final String name;
+        public final boolean muted, deaf;
 
         public Peer(long id, String name) {
+            this(id, name, false, false);
+        }
+
+        public Peer(long id, String name, boolean muted, boolean deaf) {
             this.id = id;
             this.name = name;
+            this.muted = muted;
+            this.deaf = deaf;
         }
     }
 
@@ -50,6 +61,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     private long heartbeatSentAt;
     private volatile long heartbeatAckAt;
     private volatile boolean active;
+    private boolean proximitySuspended;
     private String lastState = "";
     private String token = "";
     private volatile String salt = "";
@@ -59,8 +71,19 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     private long keyEpoch;
     private boolean refreshingKey;
     private boolean roomsSupported, roomPending;
+    private boolean proximityRoomsSupported;
+    private String region = "";
+    private boolean peerStatusSupported;
+    private boolean selfMuted, selfDeaf;
+    private boolean peerStatusDirty = true;
+    private String lastPeerStatus = "";
+    private long peerStatusSentAt;
     private volatile String roomCode = "";
     private String resumeRoom = "";
+    private String restoringRoom = "";
+    private String recoveryRoom = "";
+    private boolean failedRoomRecovery;
+    private String requiredRoom;
     private Consumer<RoomState> roomListener = state -> {};
 
     private Set<Long> nearby = Collections.emptySet();
@@ -80,21 +103,80 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     public static final class RoomState {
         public final String code, reason;
         public final long expiresAt;
+        public final boolean restorationFailed;
 
-        RoomState(String code, String reason, long expiresAt) {
+        RoomState(String code, String reason, long expiresAt, boolean restorationFailed) {
             this.code = code;
             this.reason = reason;
             this.expiresAt = expiresAt;
+            this.restorationFailed = restorationFailed;
         }
     }
 
     public synchronized void roomListener(Consumer<RoomState> listener, String resume) {
+        roomListener(listener, resume, false);
+    }
+
+    public synchronized void roomListener(Consumer<RoomState> listener, String resume, boolean paused) {
         roomListener = listener;
-        resumeRoom = resume;
+        recoveryRoom = resume;
+        failedRoomRecovery = paused && !resume.isEmpty();
+        resumeRoom = failedRoomRecovery ? "" : resume;
+        restoringRoom = resumeRoom;
     }
 
     public boolean inRoom() {
         return !roomCode.isEmpty();
+    }
+
+    public String roomCode() {
+        return roomCode;
+    }
+
+    /** Null is ordinary voice; empty blocks all audio while party discovery is in progress. */
+    public synchronized void requireRoom(String code) {
+        requiredRoom = code;
+        sendState();
+    }
+
+    private boolean scopeAllowed() {
+        return restoringRoom.isEmpty()
+                && !failedRoomRecovery
+                && (requiredRoom == null
+                        || (!requiredRoom.isEmpty() && requiredRoom.equals(roomCode)));
+    }
+
+    public synchronized boolean roomRecoveryPaused() {
+        return failedRoomRecovery;
+    }
+
+    public synchronized boolean awaitingRoomRecovery() {
+        return failedRoomRecovery || !restoringRoom.isEmpty();
+    }
+
+    /** Kept in memory only, including across a failed retry. */
+    public synchronized String recoveryRoomCode() {
+        return recoveryRoom;
+    }
+
+    public synchronized boolean retryRoomRecovery() {
+        if (!failedRoomRecovery || recoveryRoom.isEmpty() || !roomsAvailable()) {
+            return false;
+        }
+        restoringRoom = recoveryRoom;
+        failedRoomRecovery = false;
+        requestRoom("join", recoveryRoom, true);
+        return true;
+    }
+
+    public synchronized boolean returnToNearbyVoice() {
+        if (!failedRoomRecovery || roomPending || !roomCode.isEmpty()) {
+            return false;
+        }
+        recoveryRoom = "";
+        failedRoomRecovery = false;
+        sendState();
+        return true;
     }
 
     public synchronized boolean roomsAvailable() {
@@ -102,6 +184,10 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     }
 
     public synchronized void room(String action, String code) {
+        requestRoom(action, code, false);
+    }
+
+    private void requestRoom(String action, String code, boolean automatic) {
         if (!roomsAvailable()) {
             return;
         }
@@ -121,9 +207,16 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             msg.addProperty("code", normalized);
         }
         roomPending = true;
+        if (!automatic) {
+            resumeRoom = "";
+            restoringRoom = "";
+            recoveryRoom = "";
+            failedRoomRecovery = false;
+        }
         listeners = 0;
         peers = Collections.emptyList();
         roster.accept(peers);
+        sendState();
         send(msg);
     }
 
@@ -235,6 +328,8 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                 protocol = version;
                 salt = key;
                 roomsSupported = msg.has("rooms") && msg.get("rooms").getAsBoolean();
+                peerStatusSupported = optionalBoolean(msg, "peerStatus");
+                proximityRoomsSupported = optionalBoolean(msg, "proximityRooms");
                 JsonObject hello = new JsonObject();
                 hello.addProperty("type", "hello");
                 hello.addProperty("v", protocol);
@@ -276,11 +371,13 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                                         "left",
                                         "updated",
                                         "expired",
+                                        "full",
                                         "unavailable")
                                 .contains(reason)) {
                     throw new IllegalArgumentException();
                 }
-                boolean changed = !roomCode.equals(code);
+                String previousRoom = roomCode;
+                boolean changed = !previousRoom.equals(code);
                 roomCode = code;
                 if (changed) {
                     listeners = 0;
@@ -288,7 +385,19 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                     acknowledgedRevision = -1;
                     roster.accept(peers);
                 }
-                roomListener.accept(new RoomState(code, reason, expiresAt));
+                boolean restorationFailed = false;
+                if (!restoringRoom.isEmpty() && !"updated".equals(reason)) {
+                    restorationFailed = !"joined".equals(reason) || !restoringRoom.equals(code);
+                    failedRoomRecovery = restorationFailed;
+                    restoringRoom = "";
+                    if (!restorationFailed) {
+                        recoveryRoom = "";
+                    }
+                } else if ("expired".equals(reason) && !previousRoom.isEmpty() && requiredRoom == null) {
+                    recoveryRoom = previousRoom;
+                    failedRoomRecovery = restorationFailed = true;
+                }
+                roomListener.accept(new RoomState(code, reason, expiresAt, restorationFailed));
                 if ("expired".equals(reason)) {
                     JsonObject ack = new JsonObject();
                     ack.addProperty("type", "room");
@@ -298,6 +407,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                 if (!"updated".equals(reason)) {
                     roomPending = false;
                 }
+                sendState();
                 return;
             }
             if ("heartbeat".equals(type)) {
@@ -343,7 +453,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                     throw new IllegalArgumentException();
                 }
                 if (inRoom() || nearby.contains(id)) {
-                    next.add(new Peer(id, n));
+                    next.add(new Peer(id, n, optionalBoolean(p, "muted"), optionalBoolean(p, "deaf")));
                 }
             }
             acknowledgedRevision = revision;
@@ -396,7 +506,9 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     }
 
     private boolean canReceive() {
-        return activeConnection() && !deaf && !roomPending;
+        return activeConnection()
+                && (!proximitySuspended || inRoom())
+                && !deaf && !roomPending && scopeAllowed();
     }
 
     public synchronized boolean canTransmit() {
@@ -431,6 +543,11 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
 
     /** Called only with locally matched consenting voice IDs, never arbitrary player hashes. */
     public synchronized void proximity(String matchingKey, String identity, Set<Long> ids) {
+        proximity(matchingKey, identity, ids, "");
+    }
+
+    public synchronized void proximity(
+            String matchingKey, String identity, Set<Long> ids, String regionKey) {
         if (!matchingKey.equals(salt)) {
             return; // A key update raced local matching; retry with the new key next tick.
         }
@@ -438,7 +555,12 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         if (!identity.isEmpty() && !identity.matches("[0-9a-f]{64}")) {
             throw new IllegalArgumentException("Invalid voice token");
         }
+        if (!regionKey.isEmpty() && !regionKey.matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException("Invalid proximity region");
+        }
         token = identity;
+        proximitySuspended = false;
+        region = identity.isEmpty() ? "" : regionKey;
         active = !identity.isEmpty();
         activityAt = System.nanoTime();
         nearby = active ? new HashSet<>(ids) : Collections.emptySet();
@@ -456,8 +578,37 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         if (!resumeRoom.isEmpty() && roomsAvailable()) {
             String code = resumeRoom;
             resumeRoom = "";
-            room("join", code);
+            requestRoom("join", code, true);
         }
+    }
+
+    /** Keep established room audio alive without claiming an old map position is current. */
+    public synchronized boolean suspendProximity(String matchingKey, String identity) {
+        boolean changed = !proximitySuspended || !region.isEmpty() || !nearby.isEmpty();
+        // The client may refresh its established identity without reading a loading scene.
+        // Never publish an old token under a new matching-key epoch.
+        if (matchingKey.equals(salt)) {
+            if (!identity.equals(token) && !identity.isEmpty()
+                    && !identity.matches("[0-9a-f]{64}")) {
+                throw new IllegalArgumentException("Invalid voice token");
+            }
+            changed |= !identity.equals(token) || refreshingKey;
+            token = identity;
+            refreshingKey = false;
+        }
+        proximitySuspended = true;
+        region = "";
+        nearby = Collections.emptySet();
+        active = inRoom() && !token.isEmpty();
+        activityAt = System.nanoTime();
+        if (!inRoom() && !peers.isEmpty()) {
+            peers = Collections.emptyList();
+            roster.accept(peers);
+        }
+        if (changed) {
+            sendState();
+        }
+        return activeConnection() && inRoom() && !roomPending && scopeAllowed();
     }
 
     public synchronized void heartbeat() {
@@ -465,12 +616,45 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             proximity(salt, "", Collections.emptySet());
         }
         long now = System.nanoTime();
+        sendPeerStatus(now);
         if (salt.isEmpty() || (heartbeatSentAt != 0 && now - heartbeatSentAt < 5_000_000_000L)) {
             return;
         }
         if (sendText("{\"type\":\"heartbeat\"}")) {
             heartbeatSentAt = now;
         }
+    }
+
+    /** Latest self-selected controls only; transmission is coalesced by heartbeat(). */
+    public synchronized void selfStatus(boolean muted, boolean deaf) {
+        peerStatusDirty |= selfMuted != muted || selfDeaf != deaf;
+        selfMuted = muted;
+        selfDeaf = deaf;
+    }
+
+    void sendPeerStatus(long now) {
+        if (!peerStatusDirty || !peerStatusSupported || (peerStatusSentAt != 0 && now - peerStatusSentAt < 5_000_000_000L)) {
+            return;
+        }
+        String message = "{\"type\":\"status\",\"muted\":" + selfMuted + ",\"deaf\":" + selfDeaf + "}";
+        if (message.equals(lastPeerStatus)) {
+            peerStatusDirty = false;
+        } else if (sendText(message)) {
+            lastPeerStatus = message;
+            peerStatusSentAt = now;
+            peerStatusDirty = false;
+        }
+    }
+
+    private static boolean optionalBoolean(JsonObject object, String key) {
+        if (!object.has(key)) {
+            return false;
+        }
+        JsonElement value = object.get(key);
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean()) {
+            throw new IllegalArgumentException("Invalid status flag");
+        }
+        return value.getAsBoolean();
     }
 
     public synchronized void transmit(byte[] packet) {
@@ -503,14 +687,20 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         }
         JsonObject msg = new JsonObject();
         msg.addProperty("type", "state");
-        msg.addProperty("token", token);
+        msg.addProperty("token", proximitySuspended && !inRoom() ? "" : token);
+        boolean exclusive = requiredRoom != null || !restoringRoom.isEmpty() || failedRoomRecovery;
+        if (proximityRoomsSupported) {
+            msg.addProperty("region", exclusive ? "" : region);
+        }
         if (keyEpoch != 0) {
             msg.addProperty("keyEpoch", keyEpoch);
         }
-        msg.addProperty("deaf", deaf);
+        msg.addProperty("deaf", deaf || !scopeAllowed());
         JsonArray near = new JsonArray();
-        for (long id : new java.util.TreeSet<>(nearby)) {
-            near.add(id);
+        if (!exclusive) {
+            for (long id : new java.util.TreeSet<>(nearby)) {
+                near.add(id);
+            }
         }
         msg.add("near", near);
         JsonArray list = new JsonArray();
@@ -546,22 +736,51 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
 
     @Override
     public void onClosing(WebSocket webSocket, int code, String reason) {
+        log.debug(
+                "RSVC relay closing: code={}, category={}",
+                code,
+                DisconnectReason.fromClose(code, reason));
         webSocket.close(code, null);
-        fail("Relay disconnected (" + code + ")", DisconnectReason.fromClose(code, reason));
+        DisconnectReason category = DisconnectReason.fromClose(code, reason);
+        fail(
+                category == DisconnectReason.SERVER_FULL
+                        ? "Voice server full"
+                        : "Relay disconnected (" + code + ")",
+                category);
     }
 
     @Override
     public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-        fail(
+        // Exception messages and server-provided close text may contain sensitive data.
+        log.debug(
+                "RSVC transport failure: exception={}, cause={}, http={}",
+                t.getClass().getSimpleName(),
+                t.getCause() == null ? "none" : t.getCause().getClass().getSimpleName(),
+                response == null ? 0 : response.code());
+        DisconnectReason category =
                 response == null
-                        ? "Connection failed — check relay URL/network"
-                        : "Relay refused connection (HTTP " + response.code() + ")",
-                response == null || response.code() >= 500 || response.code() == 429);
+                        ? DisconnectReason.NETWORK
+                        : DisconnectReason.fromHttp(
+                                response.code(), response.header("X-RSVC-Error"));
+        fail(
+                category == DisconnectReason.SERVER_FULL
+                        ? "Voice server full"
+                        : response == null
+                                ? "Connection failed — check relay URL/network"
+                                : "Relay refused connection (HTTP " + response.code() + ")",
+                category);
     }
 
     @Override
     public void onClosed(WebSocket webSocket, int code, String reason) {
-        fail("Disconnected", DisconnectReason.fromClose(code, reason));
+        log.debug(
+                "RSVC relay closed: code={}, category={}",
+                code,
+                DisconnectReason.fromClose(code, reason));
+        DisconnectReason category = DisconnectReason.fromClose(code, reason);
+        fail(
+                category == DisconnectReason.SERVER_FULL ? "Voice server full" : "Disconnected",
+                category);
     }
 
     private void fail(String message) {
@@ -576,6 +795,11 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         if (closed) {
             return;
         }
+        log.debug(
+                "RSVC disconnect: category={}, detail={}, active={}, room={}, pending={},"
+                        + " scopeAllowed={}, revision={}, acknowledged={}, peers={}, listeners={}",
+                reason, message, activeConnection(), inRoom(), roomPending, scopeAllowed(),
+                revision, acknowledgedRevision, peers.size(), listeners);
         close();
         status.accept(message);
         ended.accept(reason);

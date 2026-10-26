@@ -8,9 +8,11 @@ import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
 import java.awt.Dimension;
+import java.awt.Font;
 import java.awt.Graphics;
 import java.awt.GridLayout;
 import java.awt.Insets;
+import java.awt.font.TextAttribute;
 import java.util.List;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -32,6 +34,14 @@ import javax.swing.SwingUtilities;
 
 /** Swing sidebar. Public update methods dispatch component changes to the EDT. */
 public final class VoicePanel extends PluginPanel {
+    private final java.util.concurrent.atomic.AtomicReference<PeerView> pendingPeers =
+            new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicBoolean peerRefreshQueued =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private final javax.swing.Timer peerRefresh = new javax.swing.Timer(1000, e -> flushPeers());
+    private final java.util.Map<Long, JLabel> peerStatusLabels = new java.util.HashMap<>();
+    private PeerView displayedPeers;
+    private volatile boolean closed;
     private final JLabel status = new JLabel("Disconnected");
     private final JPanel people = new JPanel();
     private final JLabel mutedCount = new JLabel("0 muted");
@@ -44,9 +54,22 @@ public final class VoicePanel extends PluginPanel {
     private final JButton connectButton =
             button("Connect", "Connect to nearby consenting voice users");
     private final JButton roomButton =
-            button("Room", "Create/join a private breakout or return to nearby voice");
+            button("Room", "Create/join a private room or return to nearby voice");
+    private final JButton partyButton =
+            button("Join party voice", "Join a party using Party or Hub Party Panel first");
+    private boolean partyVoice;
+    private boolean roomsAvailable;
+    private Runnable partyAction = () -> {};
     private final JLabel scope = new JLabel("Nearby · 20 tiles");
+    private final JLabel roomFeedback = new JLabel();
+    private final JPanel recoveryOptions = new JPanel();
+    private final JButton retryRoom = button("Retry room", "Try the same private room again");
+    private final JButton nearbyVoice = button("Return to nearby", "Resume nearby voice with your current mic setting");
+    private boolean recoveryPaused;
+    private Runnable retryRoomAction = () -> {};
+    private Runnable nearbyVoiceAction = () -> {};
     private final JCheckBox muted = new JCheckBox("Mute mic");
+    private final JCheckBox deaf = new JCheckBox("Deafen");
     private String roomCode = "";
     private BiConsumer<String, String> roomAction = (action, code) -> {};
 
@@ -80,7 +103,11 @@ public final class VoicePanel extends PluginPanel {
                         JOptionPane.showMessageDialog(
                                 this,
                                 "Nearby voice: within 20 tiles, same world and floor.\n"
-                                        + "Choose push-to-talk or voice activation in settings.\n",
+                                    + "Choose push-to-talk or voice activation in settings.\n"
+                                    + "Room: create or join a private voice room.\n"
+                                    + "For party use Join party voice instead.\n"
+                                    + "Default hotkeys: F8 toggles mic mute; F9 toggles deafen.\n"
+                                    + "Change hotkeys in settings; use them with game focus.\n",
                                 "Voice information",
                                 JOptionPane.INFORMATION_MESSAGE));
         addRow(top, row(new JLabel("Voice chat"), info));
@@ -117,14 +144,49 @@ public final class VoicePanel extends PluginPanel {
         addRow(top, row(connectButton, leave));
         muted.setToolTipText("Mute your microphone for everyone");
         muted.addActionListener(e -> mute.accept(muted.isSelected()));
-        JCheckBox deaf = new JCheckBox("Deafen");
         deaf.setToolTipText("Mute playback and microphone");
         deaf.addActionListener(e -> deafen.accept(deaf.isSelected()));
         addRow(top, row(muted, deaf));
         scope.setFont(scope.getFont().deriveFont(11f));
+        scope.setHorizontalAlignment(JLabel.CENTER);
+        addRow(top, scope);
         roomButton.setEnabled(false);
         roomButton.addActionListener(e -> roomMenu());
-        addRow(top, row(scope, roomButton));
+        addRow(top, roomButton);
+        partyButton.setEnabled(false);
+        partyButton.addActionListener(
+                e -> {
+                    roomFeedback.setVisible(false);
+                    partyAction.run();
+                });
+        addRow(top, partyButton);
+        roomFeedback.setVisible(false);
+        roomFeedback.setFont(roomFeedback.getFont().deriveFont(11f));
+        addRow(top, roomFeedback);
+        recoveryOptions.setLayout(new BoxLayout(recoveryOptions, BoxLayout.Y_AXIS));
+        JLabel recoveryHelp = new JLabel("<html>Couldn’t rejoin room.<br>Choose how to resume voice.</html>");
+        recoveryHelp.setFont(recoveryHelp.getFont().deriveFont(11f));
+        addRow(recoveryOptions, recoveryHelp);
+        addRow(recoveryOptions, retryRoom);
+        addRow(recoveryOptions, nearbyVoice);
+        retryRoom.addActionListener(e -> {
+            if (closed) {
+                return;
+            }
+            retryRoom.setEnabled(false);
+            nearbyVoice.setEnabled(false);
+            retryRoomAction.run();
+        });
+        nearbyVoice.addActionListener(e -> {
+            if (closed) {
+                return;
+            }
+            retryRoom.setEnabled(false);
+            nearbyVoice.setEnabled(false);
+            nearbyVoiceAction.run();
+        });
+        recoveryOptions.setVisible(false);
+        addRow(top, recoveryOptions);
         alias.setVisible(false);
         alias.setFont(alias.getFont().deriveFont(11f));
         addRow(top, alias);
@@ -147,6 +209,7 @@ public final class VoicePanel extends PluginPanel {
         bottom.add(mutedCount, BorderLayout.NORTH);
         bottom.add(row(clear, deviceButton), BorderLayout.CENTER);
         add(bottom, BorderLayout.SOUTH);
+        peerRefresh.setRepeats(false);
         peers(java.util.Collections.emptyList());
     }
 
@@ -176,11 +239,13 @@ public final class VoicePanel extends PluginPanel {
     public void status(String message) {
         SwingUtilities.invokeLater(
                 () -> {
+                    String displayed = recoveryPaused
+                            ? "Voice paused — retry room or return to nearby" : message;
                     status.setText(
                             "<html><div style='width:150px'>"
-                                    + escape(message.split(" — ", 2)[0])
+                                    + escape(displayed.split(" — ", 2)[0])
                                     + "</div></html>");
-                    status.setToolTipText(message);
+                    status.setToolTipText(displayed);
                     status.setMaximumSize(
                             new Dimension(Integer.MAX_VALUE, status.getPreferredSize().height));
                     revalidate();
@@ -199,6 +264,72 @@ public final class VoicePanel extends PluginPanel {
         roomAction = action;
     }
 
+    public void partyAction(Runnable action) {
+        partyAction = action;
+    }
+
+    public void roomRecoveryActions(Runnable retry, Runnable nearby) {
+        retryRoomAction = retry;
+        nearbyVoiceAction = nearby;
+    }
+
+    public void roomRecovery(boolean paused) {
+        SwingUtilities.invokeLater(() -> {
+            if (closed) {
+                return;
+            }
+            recoveryPaused = paused;
+            recoveryOptions.setVisible(paused);
+            retryRoom.setEnabled(paused && roomsAvailable);
+            nearbyVoice.setEnabled(paused && roomsAvailable);
+            if (paused) {
+                roomFeedback.setVisible(false);
+            }
+            updateScope();
+            revalidate();
+            repaint();
+        });
+    }
+
+    public void partyState(boolean inParty, boolean selected, boolean ready) {
+        SwingUtilities.invokeLater(
+                () -> {
+                    partyVoice = selected;
+                    partyButton.setText(selected ? "Leave party voice" : "Join party voice");
+                    partyButton.setEnabled(selected || (inParty && roomsAvailable));
+                    partyButton.setToolTipText(
+                            selected
+                                    ? "Return to nearby voice; keep your mute setting"
+                                    : inParty
+                                            ? "Replace nearby/private voice with your party's voice"
+                                                  + " room"
+                                            : "Join a party using Party or Hub Party Panel first");
+                    roomButton.setEnabled(roomsAvailable && !selected);
+                    updateScope();
+                    if (selected && !ready) {
+                        scope.setText("Joining party…");
+                    }
+                });
+    }
+
+    private void updateScope() {
+        scope.setText(
+                recoveryPaused
+                        ? "Voice paused"
+                        : partyVoice
+                        ? "Party voice"
+                        : roomCode.isEmpty() ? "Nearby · 20 tiles" : "Private room");
+        scope.setToolTipText(
+                recoveryPaused
+                        ? "No audio is sent or played until you retry the room or return to nearby"
+                        : partyVoice
+                        ? "Exclusive party voice; nearby and private-room audio are off"
+                        : roomCode.isEmpty()
+                                ? "Within 20 tiles, same world, floor and region; up to 25 per"
+                                      + " group"
+                                : "Room members only, regardless of distance, world or floor");
+    }
+
     public void roomState(String code) {
         roomState(code, false);
     }
@@ -206,29 +337,46 @@ public final class VoicePanel extends PluginPanel {
     public void roomState(String code, boolean created) {
         SwingUtilities.invokeLater(
                 () -> {
+                    if (!roomCode.equals(code) || created) {
+                        roomFeedback.setVisible(false);
+                    }
                     roomCode = code;
-                    scope.setText(code.isEmpty() ? "Nearby · 20 tiles" : "Private room");
-                    scope.setToolTipText(
-                            code.isEmpty()
-                                    ? "Within 20 tiles, same world and floor"
-                                    : "Room members only, regardless of distance, world or floor");
+                    updateScope();
                     // The relay can send an updated roster before the creation confirmation.
-                    if (created && !code.isEmpty()) {
+                    if (created && !code.isEmpty() && !partyVoice) {
                         showInviteCode();
                     }
                 });
     }
 
     public void roomsEnabled(boolean enabled) {
-        SwingUtilities.invokeLater(() -> roomButton.setEnabled(enabled));
+        SwingUtilities.invokeLater(() -> {
+            roomsAvailable = enabled;
+            retryRoom.setEnabled(recoveryPaused && enabled);
+            nearbyVoice.setEnabled(recoveryPaused && enabled);
+            roomButton.setEnabled(enabled && !partyVoice);
+            if (!enabled && !partyVoice) {
+                partyButton.setEnabled(false);
+            }
+        });
     }
 
-    public void roomExpired() {
+    public void roomFull(boolean party) {
         SwingUtilities.invokeLater(
                 () -> {
-                    scope.setText("Room expired");
-                    scope.setToolTipText(
-                            "Returned to nearby voice; microphone muted until you unmute");
+                    if (closed) {
+                        return;
+                    }
+                    roomFeedback.setText(
+                            "<html>"
+                                    + (party ? "Party voice room full" : "Room full")
+                                    + "<br>Try again later.</html>");
+                    roomFeedback.setToolTipText(
+                            "No automatic retry. Click to join again when a place opens.");
+                    roomFeedback.setMaximumSize(
+                            new Dimension(Integer.MAX_VALUE, roomFeedback.getPreferredSize().height));
+                    roomFeedback.setVisible(true);
+                    revalidate();
                 });
     }
 
@@ -236,7 +384,12 @@ public final class VoicePanel extends PluginPanel {
         SwingUtilities.invokeLater(() -> muted.setSelected(value));
     }
 
+    public void deafened(boolean value) {
+        SwingUtilities.invokeLater(() -> deaf.setSelected(value));
+    }
+
     private void roomMenu() {
+        roomFeedback.setVisible(false);
         String[] choices =
                 roomCode.isEmpty()
                         ? new String[] {"Create", "Join", "Cancel"}
@@ -297,6 +450,10 @@ public final class VoicePanel extends PluginPanel {
                     connectionActive = active;
                     if (!active) {
                         connected = false;
+                        roomFeedback.setVisible(false);
+                        recoveryPaused = false;
+                        recoveryOptions.setVisible(false);
+                        updateScope();
                     }
                     connectButton.setEnabled(!active);
                     refreshIndicator();
@@ -340,48 +497,152 @@ public final class VoicePanel extends PluginPanel {
             List<VoiceConnection.Peer> peers,
             java.util.Map<String, Integer> levels,
             java.util.Set<String> muted) {
+        if (closed) {
+            return;
+        }
+        pendingPeers.set(new PeerView(peers, levels, muted));
+        queuePeerRefresh();
+    }
+
+    private void queuePeerRefresh() {
+        if (!closed && peerRefreshQueued.compareAndSet(false, true)) {
+            SwingUtilities.invokeLater(
+                    () -> {
+                        if (!closed) {
+                            peerRefresh.restart();
+                        }
+                    });
+        }
+    }
+
+    // EDT only. One latest snapshot and one single-shot timer, never a toggle queue.
+    void flushPeers() {
+        peerRefresh.stop();
+        PeerView next = pendingPeers.getAndSet(null);
+        if (!closed && next != null) {
+            renderPeers(next);
+        }
+        peerRefreshQueued.set(false);
+        if (pendingPeers.get() != null) {
+            queuePeerRefresh();
+        }
+    }
+
+    public void close() {
+        closed = true;
+        pendingPeers.set(null);
         SwingUtilities.invokeLater(
                 () -> {
-                    people.removeAll();
-                    for (VoiceConnection.Peer peer : peers) {
-                        JPanel row = new JPanel(new BorderLayout(4, 0));
-                        row.setAlignmentX(Component.LEFT_ALIGNMENT);
-                        JPanel heading = new JPanel(new BorderLayout(4, 0));
-                        heading.add(new JLabel(peer.name), BorderLayout.CENTER);
-                        JToggleButton mute = new JToggleButton("Mute", muted.contains(peer.name));
-                        mute.setToolTipText("Mute/unmute this voice only for you");
-                        mute.setMargin(new Insets(1, 4, 1, 4));
-                        mute.setPreferredSize(new Dimension(58, 23));
-                        mute.addActionListener(e -> block.accept(peer.id, mute.isSelected()));
-                        heading.add(mute, BorderLayout.EAST);
-                        row.add(heading, BorderLayout.NORTH);
-                        JSlider slider = new JSlider(0, 200, levels.getOrDefault(peer.name, 100));
-                        slider.setPreferredSize(new Dimension(105, 20));
-                        slider.setMinimumSize(new Dimension(20, 20));
-                        slider.setToolTipText("Playback for you: 0–200%; 100% is normal");
-                        JLabel level = new JLabel(slider.getValue() + "%");
-                        level.setPreferredSize(new Dimension(38, 20));
-                        slider.addChangeListener(
-                                e -> {
-                                    level.setText(slider.getValue() + "%");
-                                    if (!slider.getValueIsAdjusting()) {
-                                        volume.accept(peer.id, slider.getValue());
-                                    }
-                                });
-                        JPanel adjustment = new JPanel(new BorderLayout());
-                        adjustment.add(slider, BorderLayout.CENTER);
-                        adjustment.add(level, BorderLayout.EAST);
-                        row.add(adjustment, BorderLayout.CENTER);
-                        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 49));
-                        people.add(row);
-                        people.add(Box.createVerticalStrut(5));
-                    }
-                    if (peers.isEmpty()) {
-                        people.add(new JLabel("No other voices"));
-                    }
-                    people.revalidate();
-                    people.repaint();
+                    peerRefresh.stop();
+                    peerRefreshQueued.set(false);
                 });
+    }
+
+    private void renderPeers(PeerView next) {
+        List<VoiceConnection.Peer> peers = next.peers;
+        java.util.Map<String, Integer> levels = next.levels;
+        java.util.Set<String> muted = next.muted;
+        boolean sameRows =
+                displayedPeers != null
+                        && displayedPeers.peers.size() == peers.size()
+                        && displayedPeers.levels.equals(levels)
+                        && displayedPeers.muted.equals(muted);
+        for (int i = 0; sameRows && i < peers.size(); i++) {
+            VoiceConnection.Peer old = displayedPeers.peers.get(i), peer = peers.get(i);
+            sameRows = old.id == peer.id && old.name.equals(peer.name);
+        }
+        displayedPeers = next;
+        if (sameRows) {
+            for (VoiceConnection.Peer peer : peers) {
+                updatePeerStatus(peerStatusLabels.get(peer.id), peer);
+            }
+            return;
+        }
+        people.removeAll();
+        peerStatusLabels.clear();
+        for (VoiceConnection.Peer peer : peers) {
+            JPanel row = new JPanel(new BorderLayout(4, 0));
+            row.setAlignmentX(Component.LEFT_ALIGNMENT);
+            JPanel heading = new JPanel(new BorderLayout(4, 0));
+            JLabel name = new JLabel(peer.name);
+            Font normalFont = name.getFont();
+            Font mutedFont =
+                    normalFont.deriveFont(
+                            java.util.Collections.singletonMap(
+                                    TextAttribute.STRIKETHROUGH, TextAttribute.STRIKETHROUGH_ON));
+            name.setFont(muted.contains(peer.name) ? mutedFont : normalFont);
+            JLabel peerStatus = new JLabel();
+            updatePeerStatus(peerStatus, peer);
+            peerStatusLabels.put(peer.id, peerStatus);
+            JPanel identity = new JPanel(new BorderLayout(3, 0));
+            identity.add(name, BorderLayout.CENTER);
+            identity.add(peerStatus, BorderLayout.EAST);
+            heading.add(identity, BorderLayout.CENTER);
+            JToggleButton mute = new JToggleButton("Mute", muted.contains(peer.name));
+            mute.setToolTipText("Mute/unmute this voice only for you");
+            mute.setMargin(new Insets(1, 4, 1, 4));
+            mute.setPreferredSize(new Dimension(58, 23));
+            mute.addActionListener(
+                    e -> {
+                        name.setFont(mute.isSelected() ? mutedFont : normalFont);
+                        block.accept(peer.id, mute.isSelected());
+                    });
+            heading.add(mute, BorderLayout.EAST);
+            row.add(heading, BorderLayout.NORTH);
+            JSlider slider = new JSlider(0, 200, levels.getOrDefault(peer.name, 100));
+            slider.setPreferredSize(new Dimension(105, 20));
+            slider.setMinimumSize(new Dimension(20, 20));
+            slider.setToolTipText("Playback for you: 0–200%; 100% is normal");
+            JLabel level = new JLabel(slider.getValue() + "%");
+            level.setPreferredSize(new Dimension(38, 20));
+            slider.addChangeListener(
+                    e -> {
+                        level.setText(slider.getValue() + "%");
+                        if (!slider.getValueIsAdjusting()) {
+                            volume.accept(peer.id, slider.getValue());
+                        }
+                    });
+            JPanel adjustment = new JPanel(new BorderLayout());
+            adjustment.add(slider, BorderLayout.CENTER);
+            adjustment.add(level, BorderLayout.EAST);
+            row.add(adjustment, BorderLayout.CENTER);
+            row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 49));
+            people.add(row);
+            people.add(Box.createVerticalStrut(5));
+        }
+        if (peers.isEmpty()) {
+            people.add(new JLabel("No other voices"));
+        }
+        people.revalidate();
+        people.repaint();
+    }
+
+    private static void updatePeerStatus(JLabel label, VoiceConnection.Peer peer) {
+        label.setIcon(PeerStatusIcon.of(peer.muted, peer.deaf));
+        String description =
+                peer.deaf
+                        ? (peer.muted
+                                ? "Self-muted and deafened"
+                                : "Self-deafened (microphone also off)")
+                        : peer.muted ? "Self-muted microphone" : null;
+        label.setToolTipText(description);
+        label.getAccessibleContext().setAccessibleDescription(description);
+        label.setVisible(peer.muted || peer.deaf);
+    }
+
+    private static final class PeerView {
+        final List<VoiceConnection.Peer> peers;
+        final java.util.Map<String, Integer> levels;
+        final java.util.Set<String> muted;
+
+        PeerView(
+                List<VoiceConnection.Peer> peers,
+                java.util.Map<String, Integer> levels,
+                java.util.Set<String> muted) {
+            this.peers = List.copyOf(peers);
+            this.levels = java.util.Map.copyOf(levels);
+            this.muted = java.util.Set.copyOf(muted);
+        }
     }
 
     private static String escape(String text) {

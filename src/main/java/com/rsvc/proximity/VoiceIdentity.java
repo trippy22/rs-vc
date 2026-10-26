@@ -29,6 +29,25 @@ public final class VoiceIdentity {
         if (!normalized.matches("[a-z0-9 -]{1,12}")) {
             throw new IllegalArgumentException("Character name unavailable");
         }
+        return digest(salt, "rs-vc-4\n" + world + "\n" + normalized);
+    }
+
+    /** Opaque region bucket, not encryption: the relay can enumerate possible regions. */
+    public static String region(String salt, int world, int region, int plane) {
+        if (salt == null
+                || !salt.matches("[0-9a-f]{64}")
+                || world < 1
+                || world > 65535
+                || region < 0
+                || region > 65535
+                || plane < 0
+                || plane > 3) {
+            throw new IllegalArgumentException("Invalid proximity context");
+        }
+        return digest(salt, "rs-vc-region-1\n" + world + "\n" + region + "\n" + plane);
+    }
+
+    private static String digest(String salt, String context) {
         byte[] key = new byte[32];
         for (int i = 0; i < key.length; i++) {
             key[i] = (byte) Integer.parseInt(salt.substring(i * 2, i * 2 + 2), 16);
@@ -36,10 +55,7 @@ public final class VoiceIdentity {
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
             mac.init(new SecretKeySpec(key, "HmacSHA256"));
-            byte[] digest =
-                    mac.doFinal(
-                            ("rs-vc-4\n" + world + "\n" + normalized)
-                                    .getBytes(StandardCharsets.UTF_8));
+            byte[] digest = mac.doFinal(context.getBytes(StandardCharsets.UTF_8));
             StringBuilder result = new StringBuilder(64);
             for (byte b : digest) {
                 result.append(Character.forDigit((b >>> 4) & 15, 16))

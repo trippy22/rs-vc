@@ -27,20 +27,58 @@ public final class AudioEngine implements AutoCloseable {
     private final SpeechActivity microphoneActivity = new SpeechActivity();
     private final ExecutorService input = executor("RS VC capture");
     private final ExecutorService output = executor("RS VC playback");
-    private final ExecutorService devices = executor("RS VC device cleanup");
+    private final ExecutorService devices;
+    private final LineProvider lines;
     private final AtomicLong captureEpoch = new AtomicLong();
+    private final AtomicLong playbackEpoch = new AtomicLong();
     private final Consumer<byte[]> transmit;
     private final BooleanSupplier audience;
     private final Consumer<String> error;
     private final IntSupplier volume;
-    private final String microphone;
+    private volatile String microphone;
+    private volatile String speakers;
     private final boolean suppressSilence;
     private volatile VoiceObserver observer;
-    private volatile TargetDataLine capture;
-    private volatile SourceDataLine speaker;
+    private volatile AudioDevice<TargetDataLine> capture;
+    private volatile AudioDevice<SourceDataLine> speaker;
     private volatile boolean closed;
     private volatile boolean deaf;
     private long sequence;
+
+    interface LineProvider {
+        Line get(boolean input, String name) throws Exception;
+    }
+
+    private static final class AudioDevice<T extends DataLine> {
+        private final T line;
+        private boolean closed;
+        private long flushGeneration;
+
+        private AudioDevice(T line) {
+            this.line = line;
+        }
+
+        // A JavaSound mixer may return the same line for the next capture. The
+        // input worker must finish this close before reopening it, and a delayed
+        // cleanup task must not close that newer capture.
+        private synchronized void close() {
+            if (!closed) {
+                closed = true;
+                line.close();
+            }
+        }
+
+        private synchronized void flush() {
+            if (!closed) {
+                flushGeneration++;
+                line.flush();
+            }
+        }
+
+        private synchronized long flushGeneration() {
+            return flushGeneration;
+        }
+    }
 
     public AudioEngine(
             String microphone,
@@ -51,14 +89,63 @@ public final class AudioEngine implements AutoCloseable {
             Consumer<String> error,
             boolean suppressSilence,
             VoiceObserver observer) {
+        this(
+                microphone,
+                speakers,
+                volume,
+                transmit,
+                audience,
+                error,
+                suppressSilence,
+                observer,
+                AudioEngine::line,
+                executor("RS VC device cleanup"));
+    }
+
+    AudioEngine(
+            String microphone,
+            String speakers,
+            IntSupplier volume,
+            Consumer<byte[]> transmit,
+            BooleanSupplier audience,
+            Consumer<String> error,
+            boolean suppressSilence,
+            VoiceObserver observer,
+            LineProvider lines,
+            ExecutorService devices) {
+        this.lines = lines;
+        this.devices = devices;
         this.microphone = microphone;
+        this.speakers = speakers;
         this.volume = volume;
         this.transmit = transmit;
         this.audience = audience;
         this.error = error;
         this.suppressSilence = suppressSilence;
         this.observer = observer;
-        output.execute(() -> play(speakers));
+        output.execute(() -> play(speakers, 0));
+    }
+
+    /** Restart only device workers; preserve packet sequence, volumes and voice connection. */
+    public boolean changeDevices(String microphone, String speakers) {
+        if (closed || (this.microphone.equals(microphone) && this.speakers.equals(speakers))) {
+            return false;
+        }
+        stopCapture();
+        this.microphone = microphone;
+        this.speakers = speakers;
+        long epoch = playbackEpoch.incrementAndGet();
+        playback.clear();
+        AudioDevice<SourceDataLine> previous = speaker;
+        if (previous != null) {
+            deviceTask(previous::close);
+        }
+        try {
+            output.execute(() -> play(speakers, epoch));
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            /* Shutdown raced a device selection. */
+        }
+        return true;
     }
 
     public void observer(VoiceObserver next) {
@@ -116,7 +203,7 @@ public final class AudioEngine implements AutoCloseable {
         captureEpoch.incrementAndGet();
         microphoneActivity.clear();
         observer.idle();
-        TargetDataLine current = capture;
+        AudioDevice<TargetDataLine> current = capture;
         if (current != null) {
             deviceTask(current::close);
         } // Unblocks read without blocking the game thread.
@@ -132,13 +219,15 @@ public final class AudioEngine implements AutoCloseable {
 
     private void capture(long epoch) {
         TargetDataLine device = null;
+        AudioDevice<TargetDataLine> session = null;
         try {
             if (closed || epoch != captureEpoch.get()) {
                 return;
             }
-            device = (TargetDataLine) line(true, microphone);
+            device = (TargetDataLine) lines.get(true, microphone);
+            session = new AudioDevice<>(device);
             device.open(FORMAT, OpusCodec.SAMPLES * 2 * 4);
-            capture = device;
+            capture = session;
             if (closed || epoch != captureEpoch.get()) {
                 return;
             }
@@ -150,6 +239,9 @@ public final class AudioEngine implements AutoCloseable {
                 while (offset < bytes.length && !closed && epoch == captureEpoch.get()) {
                     int read = device.read(bytes, offset, bytes.length - offset);
                     if (read <= 0) {
+                        if (!closed && epoch == captureEpoch.get()) {
+                            throw new IllegalStateException("Microphone stopped delivering audio");
+                        }
                         return;
                     }
                     offset += read;
@@ -185,26 +277,32 @@ public final class AudioEngine implements AutoCloseable {
             }
         } finally {
             observer.idle();
-            if (device != null) {
-                device.close();
+            if (session != null) {
+                session.close();
             }
-            if (capture == device) {
+            if (capture == session) {
                 capture = null;
             }
         }
     }
 
-    private void play(String speakers) {
+    private void play(String speakers, long epoch) {
         SourceDataLine device = null;
+        AudioDevice<SourceDataLine> session = null;
         try {
-            device = (SourceDataLine) line(false, speakers);
+            if (closed || epoch != playbackEpoch.get()) {
+                return;
+            }
+            device = (SourceDataLine) lines.get(false, speakers);
+            session = new AudioDevice<>(device);
             device.open(FORMAT, OpusCodec.SAMPLES * 2 * 4);
-            speaker = device;
-            if (closed) {
+            speaker = session;
+            if (closed || epoch != playbackEpoch.get()) {
                 return;
             }
             device.start();
-            while (!closed) {
+            while (!closed && epoch == playbackEpoch.get()) {
+                long generation = session.flushGeneration();
                 short[] pcm =
                         deaf
                                 ? new short[OpusCodec.SAMPLES]
@@ -216,23 +314,35 @@ public final class AudioEngine implements AutoCloseable {
                 }
                 // The device's bounded buffer paces playback at 20 ms per frame.
                 int offset = 0;
-                while (!closed && offset < bytes.length) {
+                while (!closed && epoch == playbackEpoch.get() && offset < bytes.length) {
+                    if (generation != session.flushGeneration()) {
+                        break;
+                    }
                     int written = device.write(bytes, offset, bytes.length - offset);
+                    // A flush legitimately interrupts a blocked write with zero or
+                    // partial progress. Discard that frame and keep the device alive.
+                    // Reading under the session lock also waits for flush to finish.
+                    if (generation != session.flushGeneration()) {
+                        break;
+                    }
                     if (written <= 0) {
+                        if (!closed && epoch == playbackEpoch.get()) {
+                            throw new IllegalStateException("Speakers stopped accepting audio");
+                        }
                         return;
                     }
                     offset += written;
                 }
             }
         } catch (Exception e) {
-            if (!closed) {
+            if (!closed && epoch == playbackEpoch.get()) {
                 error.accept("Speakers unavailable: " + e.getMessage());
             }
         } finally {
-            if (device != null) {
-                device.close();
+            if (session != null) {
+                session.close();
             }
-            if (speaker == device) {
+            if (speaker == session) {
                 speaker = null;
             }
         }
@@ -256,7 +366,7 @@ public final class AudioEngine implements AutoCloseable {
 
     public void clearPlayback() {
         playback.clear();
-        SourceDataLine current = speaker;
+        AudioDevice<SourceDataLine> current = speaker;
         if (current != null) {
             deviceTask(current::flush);
         }
@@ -296,13 +406,13 @@ public final class AudioEngine implements AutoCloseable {
         deviceTask(
                 () -> {
                     try {
-                        TargetDataLine currentCapture = capture;
+                        AudioDevice<TargetDataLine> currentCapture = capture;
                         try {
                             if (currentCapture != null) {
                                 currentCapture.close();
                             }
                         } finally {
-                            SourceDataLine currentSpeaker = speaker;
+                            AudioDevice<SourceDataLine> currentSpeaker = speaker;
                             if (currentSpeaker != null) {
                                 currentSpeaker.close();
                             }
