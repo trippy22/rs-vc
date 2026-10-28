@@ -8,18 +8,15 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
-import java.util.Set;
 
-/** Bounded protocol-5 directory. Incomplete snapshots never reach proximity matching. */
+/**
+ * Protocol-7 introductions: peers the relay matched with this client (each can see the other) or
+ * that share its invite room. There is no downloadable list of other players.
+ */
 final class VoiceDirectory {
-    static final int MAX_MEMBERS = 2000;
-    private static final int PAGE_SIZE = 64;
-    private long sequence;
-    private long revision = -1;
-    private long snapshotRevision;
-    private int total;
-    private Map<Long, String> staging;
-    private Map<Long, String> members = Collections.emptyMap();
+    // A memory bound against a hostile relay: 255 mutual sightings plus room members.
+    static final int MAX_ENTRIES = 512;
+    private Map<Long, String> members = new HashMap<>();
     private Map<String, Long> identities = Collections.emptyMap();
 
     Map<String, Long> identities() {
@@ -27,7 +24,10 @@ final class VoiceDirectory {
     }
 
     static long number(JsonObject object, String key, long min, long max) {
-        JsonElement value = object.get(key);
+        return number(object.get(key), min, max);
+    }
+
+    static long number(JsonElement value, long min, long max) {
         if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) {
             throw new IllegalArgumentException();
         }
@@ -38,105 +38,36 @@ final class VoiceDirectory {
         return n;
     }
 
-    long accept(JsonObject message) {
-        long seq = number(message, "seq", 1, 9007199254740991L);
-        if (seq != sequence + 1) {
+    /** Applies one {type:"matches", add:[{id,token}], remove:[id]} change; all or nothing. */
+    void accept(JsonObject message) {
+        JsonArray add = message.getAsJsonArray("add"), remove = message.getAsJsonArray("remove");
+        if (add == null || remove == null || add.size() + remove.size() > MAX_ENTRIES) {
             throw new IllegalArgumentException();
         }
-        long nextRevision = number(message, "revision", 0, 9007199254740991L);
-        String type = message.get("type").getAsString();
-        if ("directory_page".equals(type)) {
-            int offset = (int) number(message, "offset", 0, MAX_MEMBERS);
-            int count = (int) number(message, "total", 0, MAX_MEMBERS);
-            JsonArray entries = message.getAsJsonArray("members");
-            if (entries.size() > PAGE_SIZE
-                    || offset + entries.size() > count
-                    || count > 0 && entries.size() == 0) {
+        Map<Long, String> next = new HashMap<>(members);
+        for (JsonElement entry : remove) {
+            if (next.remove(number(entry, 1, 0xffffffffL)) == null) {
                 throw new IllegalArgumentException();
             }
-            if (offset == 0) {
-                if (staging != null || nextRevision < revision) {
-                    throw new IllegalArgumentException();
-                }
-                staging = new HashMap<>();
-                total = count;
-                snapshotRevision = nextRevision;
-            }
-            if (staging == null
-                    || offset != staging.size()
-                    || count != total
-                    || nextRevision != snapshotRevision) {
+        }
+        for (JsonElement entry : add) {
+            JsonObject item = entry.getAsJsonObject();
+            long id = number(item, "id", 1, 0xffffffffL);
+            JsonElement value = item.get("token");
+            if (value == null
+                    || !value.isJsonPrimitive()
+                    || !value.getAsJsonPrimitive().isString()
+                    || !value.getAsString().matches("[0-9a-f]{64}")) {
                 throw new IllegalArgumentException();
             }
-            for (JsonElement entry : entries) {
-                JsonObject item = entry.getAsJsonObject();
-                long id = number(item, "id", 1, 0xffffffffL);
-                String identity = identity(item, false);
-                if (staging.putIfAbsent(id, identity) != null) {
-                    throw new IllegalArgumentException();
-                }
-            }
-            if (new HashSet<>(staging.values()).size() != staging.size()) {
-                throw new IllegalArgumentException();
-            }
-            if (staging.size() == total) {
-                publish(staging, nextRevision);
-                staging = null;
-            }
-        } else if ("directory_delta".equals(type)) {
-            long from = number(message, "from", 0, 9007199254740991L);
-            JsonArray changes = message.getAsJsonArray("changes");
-            if (staging != null
-                    || from != revision
-                    || changes.size() < 1
-                    || changes.size() > PAGE_SIZE
-                    || nextRevision != from + changes.size()) {
-                throw new IllegalArgumentException();
-            }
-            Map<Long, String> next = new HashMap<>(members);
-            Set<String> unique = new HashSet<>(next.values());
-            for (JsonElement entry : changes) {
-                JsonObject item = entry.getAsJsonObject();
-                long id = number(item, "id", 1, 0xffffffffL);
-                String identity = identity(item, true), old = next.remove(id);
-                if (old != null) {
-                    unique.remove(old);
-                }
-                if (!identity.isEmpty()) {
-                    if (!unique.add(identity)) {
-                        throw new IllegalArgumentException();
-                    }
-                    next.put(id, identity);
-                }
-                if (next.size() > MAX_MEMBERS) {
-                    throw new IllegalArgumentException();
-                }
-            }
-            publish(next, nextRevision);
-        } else {
+            next.put(id, value.getAsString());
+        }
+        if (next.size() > MAX_ENTRIES || new HashSet<>(next.values()).size() != next.size()) {
             throw new IllegalArgumentException();
         }
-        sequence = seq;
-        return seq;
-    }
-
-    private static String identity(JsonObject item, boolean deletion) {
-        JsonElement value = item.get("token");
-        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
-            throw new IllegalArgumentException();
-        }
-        String identity = value.getAsString();
-        if (!(deletion && identity.isEmpty()) && !identity.matches("[0-9a-f]{64}")) {
-            throw new IllegalArgumentException();
-        }
-        return identity;
-    }
-
-    private void publish(Map<Long, String> next, long nextRevision) {
         Map<String, Long> index = new HashMap<>();
-        next.forEach((id, identity) -> index.put(identity, id));
+        next.forEach((id, token) -> index.put(token, id));
         members = next;
         identities = Collections.unmodifiableMap(index);
-        revision = nextRevision;
     }
 }

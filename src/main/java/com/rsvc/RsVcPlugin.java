@@ -3,10 +3,12 @@ package com.rsvc;
 import com.google.gson.Gson;
 import com.google.inject.Provides;
 import com.rsvc.audio.AudioEngine;
+import com.rsvc.audio.NoiseGate;
 import com.rsvc.network.DisconnectReason;
 import com.rsvc.client.VoiceClient;
 import com.rsvc.network.VoicePacket;
 import com.rsvc.network.VoiceConnection;
+import com.rsvc.party.PartyJoinRequest;
 import com.rsvc.party.PartyVoice;
 import com.rsvc.party.RsVcPartyVoice;
 import com.rsvc.proximity.ProximityMatcher;
@@ -54,6 +56,7 @@ import java.awt.event.KeyEvent;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -85,6 +88,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     @Inject private WSClient partySocket;
 
     private final PartyVoice partyVoice = new PartyVoice();
+    private final PartyJoinRequest partyJoin = new PartyJoinRequest();
 
     private VoicePanel panel;
     private VoiceObserver observer = VoiceObserver.NONE;
@@ -98,6 +102,24 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     private NavigationButton navigation;
     // These references/flags are also read by WebSocket and audio callbacks.
     private volatile AudioEngine audio;
+    // Read on the capture thread before each packet, so setting changes apply immediately.
+    private final NoiseGate.Settings gateSettings =
+            new NoiseGate.Settings() {
+                @Override
+                public boolean enabled() {
+                    return config.voiceMode() == VoiceMode.VOICE_ACTIVATED;
+                }
+
+                @Override
+                public boolean auto() {
+                    return config.voiceActivation() == VoiceActivation.AUTO;
+                }
+
+                @Override
+                public int manualDb() {
+                    return config.voiceActivationThreshold();
+                }
+            };
     private volatile boolean muted;
     private volatile boolean deaf;
     private volatile boolean held;
@@ -227,6 +249,11 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                                     () ->
                                             devicePicker.show(
                                                     panel, config.microphone(), config.speakers()));
+                    panel.micLevel(
+                            () -> {
+                                AudioEngine current = audio;
+                                return current == null ? null : current.micLevel();
+                            });
                     panel.roomActions(
                             (action, code) ->
                                     clientThread.invokeLater(
@@ -407,6 +434,8 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                         leave(message);
                     }
                 }), true, observer);
+        audio.frameMillis(next::frameMillis);
+        audio.gate(gateSettings);
         audio.deafen(deaf);
         updateListening();
         try {
@@ -485,7 +514,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         } else if ("unavailable".equals(state.reason)) {
             status("Room unavailable — current voice selection unchanged");
         } else if ("created".equals(state.reason)) {
-            status("Room created — Room → Invite code");
+            status("Room created — Room → Share code");
         }
     }
 
@@ -674,14 +703,37 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             leavePartyVoice("Left party voice — nearby voice");
             return;
         }
+        if (partyJoin.pending()) {
+            // The party voice button remains enabled while waiting so a second click cancels.
+            partyJoin.cancel();
+            updatePartyVoice();
+            status("Party voice cancelled");
+            return;
+        }
         VoiceConnection current = voice.connection();
-        if (!partyService.isInParty()
-                || partyService.getLocalMember() == null
-                || current == null
-                || !current.roomsAvailable()) {
+        if (!partyService.isInParty() || current == null) {
             status("Connect voice and join a RuneLite party first");
             return;
         }
+        if (!partyReady(current)) {
+            // RuneLite reports the party before its own member record; wait instead of
+            // dropping the click.
+            partyJoin.request(monotonicMillis());
+            updatePartyVoice();
+            status("Joining party voice — waiting for the party to sync");
+            return;
+        }
+        startPartyVoice(current);
+    }
+
+    private boolean partyReady(VoiceConnection current) {
+        return partyService.isInParty()
+                && partyService.getLocalMember() != null
+                && current != null
+                && current.roomsAvailable();
+    }
+
+    private void startPartyVoice(VoiceConnection current) {
         partyVoice.start(
                 partyService.getPartyId(),
                 partyService.getLocalMember().getMemberId(),
@@ -749,6 +801,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void leavePartyVoice(String message) {
+        partyJoin.cancel();
         boolean resume = voice.connectionWanted();
         // Closing cancels any in-flight room creation/join before returning to nearby voice.
         leave(message);
@@ -758,6 +811,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
     }
 
     private void stopPartyVoice() {
+        partyJoin.cancel();
         if (!voice.partySelected()) {
             return;
         }
@@ -786,6 +840,20 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         }
         VoiceConnection current = voice.connection();
         boolean inParty = partyService.isInParty() && partyService.getLocalMember() != null;
+        if (partyJoin.pending() && !partyService.isInParty()) {
+            partyJoin.cancel();
+            status("Left the party — party voice cancelled");
+        }
+        switch (partyJoin.step(!voice.partySelected() && partyReady(current), monotonicMillis())) {
+            case START:
+                startPartyVoice(current);
+                return;
+            case EXPIRED:
+                status("Couldn't join party voice — the party didn't sync; try again");
+                break;
+            default:
+                break;
+        }
         if (voice.partySelected() && !partyVoice.sameParty(partyService.getPartyId())) {
             leavePartyVoice("Party changed — nearby voice");
             return;
@@ -819,8 +887,8 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         if (panel != null) {
             panel.roomsEnabled(current != null && current.roomsAvailable());
             panel.partyState(
-                    inParty,
-                    voice.partySelected(),
+                    inParty || partyJoin.pending(),
+                    voice.partySelected() || partyJoin.pending(),
                     voice.partySelected()
                             && inParty
                             && current != null
@@ -905,6 +973,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         WorldPoint origin = self.getWorldLocation();
         Map<String, Player> namedPlayers = new HashMap<>();
         Set<String> nearbyNames = new HashSet<>();
+        List<Player> inRange = new ArrayList<>();
         for (Player player : visiblePlayers) {
             if (player == self || player.getName() == null || player.getWorldView() != view) {
                 continue;
@@ -923,6 +992,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                     true)) {
                 namedPlayers.put(player.getName(), player);
                 nearbyNames.add(player.getName());
+                inRange.add(player);
             } else if (current.inRoom()) {
                 // A room member may be visible outside the ordinary proximity radius.
                 namedPlayers.put(player.getName(), player);
@@ -941,8 +1011,16 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                             nearby.add(id);
                         }
                     });
+            // Nearest first, so a crowd beyond the cap keeps the closest characters.
+            inRange.sort(Comparator.comparingInt(p -> p.getWorldLocation().distanceTo(origin)));
+            List<String> names = new ArrayList<>();
+            for (Player player : inRange) {
+                names.add(player.getName());
+            }
+            Set<String> seen =
+                    matcher.fingerprints(salt, client.getWorld(), names, VoiceConnection.MAX_SEEN);
             voice.position(salt, self.getName(), client.getWorld(), nearby,
-                    origin.getRegionID(), origin.getPlane());
+                    origin.getRegionID(), origin.getPlane(), seen);
             if (!current.inRoom()) {
                 for (VoiceConnection.Peer peer : peers) {
                     if (!nearby.contains(peer.id) && audio != null) {

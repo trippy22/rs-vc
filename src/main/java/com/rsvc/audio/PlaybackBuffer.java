@@ -4,6 +4,7 @@ import com.rsvc.network.VoicePacket;
 
 import io.github.jaredmdobson.concentus.OpusDecoder;
 import io.github.jaredmdobson.concentus.OpusException;
+import io.github.jaredmdobson.concentus.OpusPacketInfo;
 
 import java.util.ArrayDeque;
 import java.util.HashMap;
@@ -13,6 +14,13 @@ import java.util.Map;
 /** Bounded jitter queues and per-speaker decoders; all work is off the game thread. */
 public final class PlaybackBuffer {
     private static final int MAX_SPEAKERS = 8;
+    // Queued audio is counted in 20 ms playback frames; a 40 ms packet counts twice.
+    private static final int MAX_QUEUED_FRAMES = 5;
+    private static final int PRIMED_FRAMES = 2;
+    // Short sequence gaps are lost audio and are concealed. Longer gaps are omitted silence.
+    private static final int MAX_CONCEALED_GAP = 3;
+    // Concealment played when a primed stream runs dry, so speech fades instead of clicking.
+    private static final int UNDERRUN_CONCEALMENT = 2;
     private final Map<Long, Stream> streams = new HashMap<>();
     private Map<Long, Integer> volumes = java.util.Collections.emptyMap();
 
@@ -20,18 +28,59 @@ public final class PlaybackBuffer {
         volumes = new HashMap<>(values);
     }
 
+    private static final class Frame {
+        final byte[] opus; // Null for a lost frame the decoder must conceal.
+        final float gain;
+        final int frames;
+
+        Frame(byte[] opus, float gain, int frames) {
+            this.opus = opus;
+            this.gain = gain;
+            this.frames = frames;
+        }
+    }
+
     private static final class Stream {
         OpusDecoder decoder = OpusCodec.decoder();
-        final ArrayDeque<VoicePacket> queue = new ArrayDeque<>();
+        final ArrayDeque<Frame> queue = new ArrayDeque<>();
+        int queuedFrames;
+        short[] carry; // Second half of a decoded 40 ms packet; counted in queuedFrames.
+        float carryGain;
         long receivedAt;
         long sequence = -1;
+        int packetFrames = 1;
+        float gain;
+        int concealed;
         boolean primed;
         final SpeechActivity activity = new SpeechActivity();
 
         Stream() throws OpusException {}
+
+        void reset() throws OpusException {
+            decoder = OpusCodec.decoder();
+            queue.clear();
+            queuedFrames = 0;
+            carry = null;
+            concealed = 0;
+            primed = false;
+        }
+
+        void dropOldest() {
+            if (carry != null) {
+                carry = null;
+                queuedFrames--;
+            } else {
+                queuedFrames -= queue.poll().frames;
+            }
+        }
     }
 
     public synchronized void offer(VoicePacket packet, long now) throws OpusException {
+        int frames = frames(packet.opus);
+        if (frames == 0) {
+            // Only 20 and 40 ms packets are played, even if a hostile relay supplies valid Opus.
+            return;
+        }
         Stream stream = streams.get(packet.speaker);
         if (stream == null) {
             if (streams.size() >= MAX_SPEAKERS) {
@@ -44,65 +93,132 @@ public final class PlaybackBuffer {
         if (stream.sequence != -1 && (delta == 0 || delta >= 0x80000000L)) {
             return;
         }
-        if (stream.sequence != -1 && delta > 1) {
-            // Suppressed frames advance the sender's sequence. Start fresh after a
-            // gap; never synthesize/replay a long silent interval or queued old speech.
-            stream.decoder = OpusCodec.decoder();
-            stream.queue.clear();
-            stream.primed = false;
+        if (stream.sequence != -1) {
+            // Sequences count 20 ms frames, including suppressed ones, so a long gap is
+            // silence. Start fresh then; never synthesize/replay a long silent interval.
+            long missing = delta - stream.packetFrames;
+            if (missing > MAX_CONCEALED_GAP) {
+                stream.reset();
+            } else {
+                for (long n = 0; n < missing; n++) {
+                    stream.queue.add(new Frame(null, stream.gain, 1));
+                    stream.queuedFrames++;
+                }
+            }
         }
         stream.sequence = packet.sequence;
+        stream.packetFrames = frames;
+        stream.gain = packet.gain;
         stream.receivedAt = now;
-        // Never play a growing backlog of old speech after TCP stalls.
-        if (stream.queue.size() >= 5) {
-            stream.queue.clear();
-            stream.primed = false;
+        stream.queue.add(new Frame(packet.opus, packet.gain, frames));
+        stream.queuedFrames += frames;
+        // Never play a growing backlog of old speech after TCP stalls. Keep the newest
+        // audio at the priming depth instead of discarding everything and re-priming.
+        if (stream.queuedFrames > MAX_QUEUED_FRAMES) {
+            while (stream.queuedFrames > PRIMED_FRAMES) {
+                stream.dropOldest();
+            }
         }
-        stream.queue.add(packet);
+    }
+
+    private static int frames(byte[] opus) {
+        try {
+            int samples = OpusPacketInfo.getNumSamples(opus, 0, opus.length, OpusCodec.RATE);
+            if (samples == OpusCodec.SAMPLES || samples == 2 * OpusCodec.SAMPLES) {
+                return samples / OpusCodec.SAMPLES;
+            }
+        } catch (RuntimeException ignored) {
+            // Malformed packets (negative counts or parser errors) are dropped like
+            // unsupported durations.
+        }
+        return 0;
     }
 
     public synchronized short[] mix(long now, int volume) {
         int[] sum = new int[OpusCodec.SAMPLES];
-        Iterator<Stream> iter = streams.values().iterator();
+        Iterator<Map.Entry<Long, Stream>> iter = streams.entrySet().iterator();
         while (iter.hasNext()) {
-            Stream stream = iter.next();
+            Map.Entry<Long, Stream> entry = iter.next();
+            Stream stream = entry.getValue();
             if (now - stream.receivedAt > 200) {
                 iter.remove();
                 continue;
             }
-            if (!stream.primed && stream.queue.size() < 2 && now - stream.receivedAt < 40) {
-                continue;
-            }
-            stream.primed = true;
-            VoicePacket packet = stream.queue.poll();
-            if (packet == null) {
-                stream.primed = false;
-                continue;
-            }
-            try {
-                short[] pcm = new short[OpusCodec.SAMPLES];
-                int size =
-                        stream.decoder.decode(
-                                packet.opus, 0, packet.opus.length, pcm, 0, pcm.length, false);
-                // Non-20ms packets are discarded even if a hostile relay supplies valid Opus.
-                if (size != pcm.length) {
+            short[] pcm;
+            float packetGain;
+            boolean real;
+            if (stream.carry != null) {
+                pcm = stream.carry;
+                packetGain = stream.carryGain;
+                real = true;
+                stream.carry = null;
+                stream.queuedFrames--;
+            } else {
+                if (!stream.primed
+                        && stream.queuedFrames < PRIMED_FRAMES
+                        && now - stream.receivedAt < 40) {
                     continue;
                 }
-                float gain =
-                        packet.gain
-                                * Math.max(0, Math.min(100, volume))
-                                / 100f
-                                * Math.max(
-                                        0, Math.min(200, volumes.getOrDefault(packet.speaker, 100)))
-                                / 100f;
-                if (gain > 0) {
-                    stream.activity.observe(pcm, now);
+                Frame frame = stream.queue.poll();
+                if (frame == null) {
+                    if (!stream.primed || stream.concealed >= UNDERRUN_CONCEALMENT) {
+                        stream.primed = false;
+                        continue;
+                    }
+                    stream.concealed++;
+                    frame = new Frame(null, stream.gain, 1);
+                } else {
+                    stream.queuedFrames -= frame.frames;
                 }
-                for (int i = 0; i < pcm.length; i++) {
-                    sum[i] += (int) (pcm[i] * gain);
+                stream.primed = true;
+                real = frame.opus != null;
+                if (real) {
+                    stream.concealed = 0;
                 }
-            } catch (OpusException | RuntimeException ignored) {
-                iter.remove();
+                packetGain = frame.gain;
+                try {
+                    short[] decoded = new short[frame.frames * OpusCodec.SAMPLES];
+                    int size =
+                            real
+                                    ? stream.decoder.decode(
+                                            frame.opus,
+                                            0,
+                                            frame.opus.length,
+                                            decoded,
+                                            0,
+                                            decoded.length,
+                                            false)
+                                    : stream.decoder.decode(
+                                            null, 0, 0, decoded, 0, decoded.length, false);
+                    if (size != decoded.length) {
+                        continue;
+                    }
+                    if (frame.frames == 2) {
+                        pcm = java.util.Arrays.copyOf(decoded, OpusCodec.SAMPLES);
+                        stream.carry =
+                                java.util.Arrays.copyOfRange(
+                                        decoded, OpusCodec.SAMPLES, decoded.length);
+                        stream.carryGain = packetGain;
+                        stream.queuedFrames++;
+                    } else {
+                        pcm = decoded;
+                    }
+                } catch (OpusException | RuntimeException ignored) {
+                    iter.remove();
+                    continue;
+                }
+            }
+            float gain =
+                    packetGain
+                            * Math.max(0, Math.min(100, volume))
+                            / 100f
+                            * Math.max(0, Math.min(200, volumes.getOrDefault(entry.getKey(), 100)))
+                            / 100f;
+            if (gain > 0 && real) {
+                stream.activity.observe(pcm, now);
+            }
+            for (int i = 0; i < pcm.length; i++) {
+                sum[i] += (int) (pcm[i] * gain);
             }
         }
         short[] result = new short[sum.length];
@@ -133,5 +249,10 @@ public final class PlaybackBuffer {
 
     synchronized int speakerCount() {
         return streams.size();
+    }
+
+    synchronized int queuedFrames(long speaker) {
+        Stream stream = streams.get(speaker);
+        return stream == null ? 0 : stream.queuedFrames;
     }
 }

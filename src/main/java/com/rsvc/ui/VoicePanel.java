@@ -1,5 +1,6 @@
 package com.rsvc.ui;
 
+import com.rsvc.audio.NoiseGate;
 import com.rsvc.network.VoiceConnection;
 
 import net.runelite.client.ui.PluginPanel;
@@ -16,6 +17,7 @@ import java.awt.font.TextAttribute;
 import java.util.List;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import javax.swing.BorderFactory;
 import javax.swing.Box;
@@ -39,6 +41,11 @@ public final class VoicePanel extends PluginPanel {
     private final java.util.concurrent.atomic.AtomicBoolean peerRefreshQueued =
             new java.util.concurrent.atomic.AtomicBoolean();
     private final javax.swing.Timer peerRefresh = new javax.swing.Timer(1000, e -> flushPeers());
+    // Polls the capture thread's latest level; only repaints while the panel is visible.
+    private final javax.swing.Timer micRefresh = new javax.swing.Timer(100, e -> refreshMic(false));
+    private final MicLevelMeter micMeter = new MicLevelMeter();
+    private final JLabel micText = new JLabel(MicLevelMeter.describe(null));
+    private volatile Supplier<NoiseGate.Level> micLevel = () -> null;
     private final java.util.Map<Long, JLabel> peerStatusLabels = new java.util.HashMap<>();
     private PeerView displayedPeers;
     private volatile boolean closed;
@@ -54,10 +61,11 @@ public final class VoicePanel extends PluginPanel {
     private final JButton connectButton =
             button("Connect", "Connect to nearby consenting voice users");
     private final JButton roomButton =
-            button("Room", "Create/join a private room or return to nearby voice");
+            button("Private Room [inactive]", "Create/join a private room or return to nearby voice");
     private final JButton partyButton =
-            button("Join party voice", "Join a party using Party or Hub Party Panel first");
+            button("Party Voice [inactive]", "Join a party using Party or Hub Party Panel first");
     private boolean partyVoice;
+    private boolean partyReady;
     private boolean roomsAvailable;
     private Runnable partyAction = () -> {};
     private final JLabel scope = new JLabel("Nearby · 20 tiles");
@@ -105,7 +113,7 @@ public final class VoicePanel extends PluginPanel {
                                 "Nearby voice: within 20 tiles, same world and floor.\n"
                                     + "Choose push-to-talk or voice activation in settings.\n"
                                     + "Room: create or join a private voice room.\n"
-                                    + "For party use Join party voice instead.\n"
+                                    + "For party use Party Voice instead.\n"
                                     + "Default hotkeys: F8 toggles mic mute; F9 toggles deafen.\n"
                                     + "Change hotkeys in settings; use them with game focus.\n",
                                 "Voice information",
@@ -147,10 +155,18 @@ public final class VoicePanel extends PluginPanel {
         deaf.setToolTipText("Mute playback and microphone");
         deaf.addActionListener(e -> deafen.accept(deaf.isSelected()));
         addRow(top, row(muted, deaf));
+        micMeter.setToolTipText(
+                "Your microphone level. The yellow mark is where voice activation starts sending.");
+        micText.setFont(micText.getFont().deriveFont(11f));
+        JPanel mic = new JPanel(new BorderLayout(0, 2));
+        mic.add(micMeter, BorderLayout.NORTH);
+        mic.add(micText, BorderLayout.CENTER);
+        addRow(top, mic);
         scope.setFont(scope.getFont().deriveFont(11f));
         scope.setHorizontalAlignment(JLabel.CENTER);
         addRow(top, scope);
         roomButton.setEnabled(false);
+        updateVoiceButtons();
         roomButton.addActionListener(e -> roomMenu());
         addRow(top, roomButton);
         partyButton.setEnabled(false);
@@ -295,11 +311,13 @@ public final class VoicePanel extends PluginPanel {
         SwingUtilities.invokeLater(
                 () -> {
                     partyVoice = selected;
-                    partyButton.setText(selected ? "Leave party voice" : "Join party voice");
+                    partyReady = ready;
                     partyButton.setEnabled(selected || (inParty && roomsAvailable));
                     partyButton.setToolTipText(
                             selected
-                                    ? "Return to nearby voice; keep your mute setting"
+                                    ? ready
+                                            ? "Leave party voice and return to nearby; keep your mute setting"
+                                            : "Cancel joining party voice; keep your mute setting"
                                     : inParty
                                             ? "Replace nearby/private voice with your party's voice"
                                                   + " room"
@@ -313,6 +331,7 @@ public final class VoicePanel extends PluginPanel {
     }
 
     private void updateScope() {
+        updateVoiceButtons();
         scope.setText(
                 recoveryPaused
                         ? "Voice paused"
@@ -330,6 +349,18 @@ public final class VoicePanel extends PluginPanel {
                                 : "Room members only, regardless of distance, world or floor");
     }
 
+    private void updateVoiceButtons() {
+        boolean available = roomsAvailable && !recoveryPaused;
+        styleVoiceButton(roomButton, "Private Room", available && !partyVoice && !roomCode.isEmpty());
+        styleVoiceButton(partyButton, "Party Voice", available && partyVoice && partyReady);
+    }
+
+    private static void styleVoiceButton(JButton button, String label, boolean active) {
+        button.setText(label + (active ? " [active]" : " [inactive]"));
+        button.setBackground(active ? new Color(45, 105, 65) : new Color(125, 50, 50));
+        button.setForeground(Color.WHITE);
+    }
+
     public void roomState(String code) {
         roomState(code, false);
     }
@@ -344,7 +375,7 @@ public final class VoicePanel extends PluginPanel {
                     updateScope();
                     // The relay can send an updated roster before the creation confirmation.
                     if (created && !code.isEmpty() && !partyVoice) {
-                        showInviteCode();
+                        showShareCode();
                     }
                 });
     }
@@ -352,6 +383,7 @@ public final class VoicePanel extends PluginPanel {
     public void roomsEnabled(boolean enabled) {
         SwingUtilities.invokeLater(() -> {
             roomsAvailable = enabled;
+            updateVoiceButtons();
             retryRoom.setEnabled(recoveryPaused && enabled);
             nearbyVoice.setEnabled(recoveryPaused && enabled);
             roomButton.setEnabled(enabled && !partyVoice);
@@ -380,6 +412,29 @@ public final class VoicePanel extends PluginPanel {
                 });
     }
 
+    /** Source of the live microphone level; null readings mean the mic is not capturing. */
+    public void micLevel(Supplier<NoiseGate.Level> source) {
+        micLevel = source;
+        SwingUtilities.invokeLater(
+                () -> {
+                    if (!closed) {
+                        micRefresh.start();
+                    }
+                });
+    }
+
+    void refreshMic(boolean force) {
+        if (closed || !(force || isShowing())) {
+            return;
+        }
+        NoiseGate.Level level = micLevel.get();
+        micMeter.level(level);
+        String text = MicLevelMeter.describe(level);
+        if (!text.equals(micText.getText())) {
+            micText.setText(text);
+        }
+    }
+
     public void microphoneMuted(boolean value) {
         SwingUtilities.invokeLater(() -> muted.setSelected(value));
     }
@@ -393,7 +448,7 @@ public final class VoicePanel extends PluginPanel {
         String[] choices =
                 roomCode.isEmpty()
                         ? new String[] {"Create", "Join", "Cancel"}
-                        : new String[] {"Invite code", "Leave room", "Cancel"};
+                        : new String[] {"Share code", "Leave room", "Cancel"};
         int choice =
                 javax.swing.JOptionPane.showOptionDialog(
                         this,
@@ -423,13 +478,13 @@ public final class VoicePanel extends PluginPanel {
                 }
             }
         } else if (choice == 0) {
-            showInviteCode();
+            showShareCode();
         } else if (choice == 1) {
             roomAction.accept("leave", "");
         }
     }
 
-    private void showInviteCode() {
+    private void showShareCode() {
         if (roomCode.isEmpty()) {
             return;
         }
@@ -441,7 +496,7 @@ public final class VoicePanel extends PluginPanel {
                     invite.selectAll();
                 });
         JOptionPane.showMessageDialog(
-                this, invite, "Select and copy invite code", JOptionPane.PLAIN_MESSAGE);
+                this, invite, "Select and copy code", JOptionPane.PLAIN_MESSAGE);
     }
 
     public void connectionActive(boolean active) {
@@ -534,6 +589,7 @@ public final class VoicePanel extends PluginPanel {
         SwingUtilities.invokeLater(
                 () -> {
                     peerRefresh.stop();
+                    micRefresh.stop();
                     peerRefreshQueued.set(false);
                 });
     }

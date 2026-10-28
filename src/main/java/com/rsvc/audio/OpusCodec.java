@@ -42,7 +42,7 @@ public final class OpusCodec {
 
     public static byte[] encode(OpusEncoder encoder, short[] pcm) throws OpusException {
         byte[] out = new byte[VoicePacket.MAX_OPUS];
-        int size = encoder.encode(pcm, 0, SAMPLES, out, 0, out.length);
+        int size = encoder.encode(pcm, 0, pcm.length, out, 0, out.length);
         return Arrays.copyOf(out, size);
     }
 }

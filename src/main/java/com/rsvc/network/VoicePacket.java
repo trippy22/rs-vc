@@ -3,7 +3,11 @@ package com.rsvc.network;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
-/** Fixed mono, 48 kHz, 20 ms Opus packets. Integers use network byte order. */
+/**
+ * Mono, 48 kHz Opus packets. Senders use 20 ms; receivers also play 40 ms. Sequences count 20 ms
+ * frames, including omitted ones, and a packet carries its first frame's number. Integers use
+ * network byte order.
+ */
 public final class VoicePacket {
     public static final int MAX_OPUS = 400;
     public final long speaker;

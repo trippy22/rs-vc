@@ -25,8 +25,8 @@ When alone, your mic indicator can still react, but no audio is uploaded.
 
 ## Private rooms
 
-Open **Room** to **Create** a room and share its invite code, or **Join** with a code.
-Use **Invite code** to copy it again and **Leave room** to return to nearby voice.
+Open **Room** to **Create** a room and share its code, or **Join** with a code.
+Use **Share code** to copy it again and **Leave room** to return to nearby voice.
 
 Rooms replace nearby voice and work across distances, worlds and floors while
 you're logged in. Keep codes private: anyone with a valid code can join. Rooms

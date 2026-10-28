@@ -63,11 +63,19 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     private volatile boolean active;
     private boolean proximitySuspended;
     private String lastState = "";
+    // What the relay holds for near and seen, so states can carry only the changes. A new
+    // connection starts empty on both sides; a key change resends both lists in full,
+    // because the relay drops states it receives under the old key.
+    private Set<Long> sentNear = Collections.emptySet();
+    private Set<String> sentSeen = Collections.emptySet();
+    private boolean resendLists = true;
     private String token = "";
     private volatile String salt = "";
+    public static final int MAX_SEEN = 255;
     private volatile Map<String, Long> directory = Collections.emptyMap();
     private final VoiceDirectory pagedDirectory = new VoiceDirectory();
     private int protocol;
+    private volatile int frameMillis = 20;
     private long keyEpoch;
     private boolean refreshingKey;
     private boolean roomsSupported, roomPending;
@@ -87,8 +95,12 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     private Consumer<RoomState> roomListener = state -> {};
 
     private Set<Long> nearby = Collections.emptySet();
+    // Fingerprints of visible characters (first five hex digits of their tokens), for mutual
+    // discovery. Full tokens of other players never leave the client.
+    private Set<String> seen = Collections.emptySet();
     private long revision;
     private long acknowledgedRevision = -1;
+    private volatile long selfId;
     private int listeners;
     private volatile WebSocket socket;
     private volatile boolean open;
@@ -189,6 +201,9 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
 
     private void requestRoom(String action, String code, boolean automatic) {
         if (!roomsAvailable()) {
+            if (!automatic) {
+                status.accept("Voice isn't connected yet — try the room again");
+            }
             return;
         }
         if (!action.equals("create") && !action.equals("join") && !action.equals("leave")) {
@@ -316,7 +331,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             JsonObject msg = gson.fromJson(text, JsonObject.class);
             String type = msg.get("type").getAsString();
             if ("welcome".equals(type)) {
-                int version = (int) VoiceDirectory.number(msg, "v", 5, 5);
+                int version = (int) VoiceDirectory.number(msg, "v", 7, 7);
                 String key = msg.get("salt").getAsString();
                 if (!key.matches("[0-9a-f]{64}") || !salt.isEmpty()) {
                     throw new IllegalArgumentException();
@@ -325,6 +340,16 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                         msg.has("keyEpoch")
                                 ? VoiceDirectory.number(msg, "keyEpoch", 1, 9007199254740991L)
                                 : 0;
+                if (msg.has("id")) {
+                    selfId = VoiceDirectory.number(msg, "id", 1, 0xffffffffL);
+                }
+                if (msg.has("frameMs")) {
+                    long frame = VoiceDirectory.number(msg, "frameMs", 20, 40);
+                    if (frame != 20 && frame != 40) {
+                        throw new IllegalArgumentException();
+                    }
+                    frameMillis = (int) frame;
+                }
                 protocol = version;
                 salt = key;
                 roomsSupported = msg.has("rooms") && msg.get("rooms").getAsBoolean();
@@ -352,6 +377,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                 }
                 keyEpoch = epoch;
                 refreshingKey = true;
+                resendLists = true;
                 salt = key;
                 // Existing routing/audio stays valid; only fresh local matching may send state.
                 // Pending directory pages and their ACKs remain ordered on this socket.
@@ -414,16 +440,9 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                 heartbeatAckAt = System.nanoTime();
                 return;
             }
-            if ("directory_page".equals(type) || "directory_delta".equals(type)) {
-                if (protocol != 5) {
-                    throw new IllegalArgumentException();
-                }
-                long seq = pagedDirectory.accept(msg);
+            if ("matches".equals(type)) {
+                pagedDirectory.accept(msg);
                 directory = pagedDirectory.identities();
-                JsonObject ack = new JsonObject();
-                ack.addProperty("type", "directory_ack");
-                ack.addProperty("seq", seq);
-                send(ack);
                 return;
             }
             if (!"peers".equals(type)) {
@@ -438,7 +457,8 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             }
             int audience = msg.get("listeners").getAsInt();
             JsonArray array = msg.getAsJsonArray("peers");
-            if (array.size() > VoiceDirectory.MAX_MEMBERS - 1
+            // Rosters only name peers this client was introduced to.
+            if (array.size() > VoiceDirectory.MAX_ENTRIES
                     || audience < 0
                     || audience > array.size()) {
                 throw new IllegalArgumentException();
@@ -523,6 +543,21 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         return salt;
     }
 
+    /** This connection's relay ID from welcome, or 0 before it arrives. */
+    public long selfId() {
+        return selfId;
+    }
+
+    /** True once the relay has acknowledged the latest state (registration accepted). */
+    public synchronized boolean stateAcknowledged() {
+        return revision > 0 && acknowledgedRevision == revision;
+    }
+
+    /** Opus packet duration the relay asked for in welcome: 20 (default) or 40 ms. */
+    public int frameMillis() {
+        return frameMillis;
+    }
+
     public Map<String, Long> directory() {
         return directory;
     }
@@ -548,6 +583,15 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
 
     public synchronized void proximity(
             String matchingKey, String identity, Set<Long> ids, String regionKey) {
+        proximity(matchingKey, identity, ids, regionKey, Collections.emptySet());
+    }
+
+    public synchronized void proximity(
+            String matchingKey,
+            String identity,
+            Set<Long> ids,
+            String regionKey,
+            Set<String> fingerprints) {
         if (!matchingKey.equals(salt)) {
             return; // A key update raced local matching; retry with the new key next tick.
         }
@@ -558,12 +602,17 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         if (!regionKey.isEmpty() && !regionKey.matches("[0-9a-f]{64}")) {
             throw new IllegalArgumentException("Invalid proximity region");
         }
+        if (fingerprints.size() > MAX_SEEN
+                || !fingerprints.stream().allMatch(f -> f.matches("[0-9a-f]{5}"))) {
+            throw new IllegalArgumentException("Invalid sightings");
+        }
         token = identity;
         proximitySuspended = false;
         region = identity.isEmpty() ? "" : regionKey;
         active = !identity.isEmpty();
         activityAt = System.nanoTime();
         nearby = active ? new HashSet<>(ids) : Collections.emptySet();
+        seen = active ? new java.util.TreeSet<>(fingerprints) : Collections.emptySet();
         List<Peer> retained = new ArrayList<>();
         for (Peer peer : peers) {
             if (inRoom() || nearby.contains(peer.id)) {
@@ -599,6 +648,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         proximitySuspended = true;
         region = "";
         nearby = Collections.emptySet();
+        seen = Collections.emptySet();
         active = inRoom() && !token.isEmpty();
         activityAt = System.nanoTime();
         if (!inRoom() && !peers.isEmpty()) {
@@ -696,26 +746,83 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             msg.addProperty("keyEpoch", keyEpoch);
         }
         msg.addProperty("deaf", deaf || !scopeAllowed());
-        JsonArray near = new JsonArray();
-        if (!exclusive) {
-            for (long id : new java.util.TreeSet<>(nearby)) {
-                near.add(id);
-            }
-        }
-        msg.add("near", near);
         JsonArray list = new JsonArray();
         for (long id : new java.util.TreeSet<>(blocked)) {
             list.add(id);
         }
         msg.add("blocked", list);
+        Set<Long> near = exclusive ? Collections.emptySet() : new java.util.TreeSet<>(nearby);
+        Set<String> sightings =
+                !exclusive && !region.isEmpty() && !(proximitySuspended && !inRoom())
+                        ? new java.util.TreeSet<>(seen)
+                        : Collections.emptySet();
         String text = gson.toJson(msg);
-        if (!text.equals(lastState)) {
-            msg.addProperty("rev", revision + 1);
-            if (sendText(gson.toJson(msg))) {
-                revision++;
-                lastState = text;
+        boolean full = resendLists;
+        if (!full && text.equals(lastState) && near.equals(sentNear) && sightings.equals(sentSeen)) {
+            return;
+        }
+        listChange(msg, "near", near, full ? null : sentNear, JsonArray::add);
+        listChange(msg, "seen", sightings, full ? null : sentSeen, null);
+        msg.addProperty("rev", revision + 1);
+        if (sendText(gson.toJson(msg))) {
+            revision++;
+            lastState = text;
+            sentNear = near;
+            sentSeen = sightings;
+            resendLists = false;
+        }
+    }
+
+    /**
+     * Adds one set to a state: the full list, or nameAdd/nameRemove when that is smaller, or
+     * nothing when it is unchanged. Fingerprints (adder null) are concatenated hex strings.
+     */
+    private static <T> void listChange(
+            JsonObject msg,
+            String name,
+            Set<T> next,
+            Set<T> previous,
+            java.util.function.BiConsumer<JsonArray, T> adder) {
+        if (previous != null && next.equals(previous)) {
+            return;
+        }
+        List<T> added = new ArrayList<>(), removed = new ArrayList<>();
+        if (previous != null) {
+            for (T item : next) {
+                if (!previous.contains(item)) {
+                    added.add(item);
+                }
+            }
+            for (T item : previous) {
+                if (!next.contains(item)) {
+                    removed.add(item);
+                }
             }
         }
+        if (previous == null || added.size() + removed.size() >= next.size()) {
+            msg.add(name, encode(new ArrayList<>(next), adder));
+            return;
+        }
+        if (!added.isEmpty()) {
+            msg.add(name + "Add", encode(added, adder));
+        }
+        if (!removed.isEmpty()) {
+            msg.add(name + "Remove", encode(removed, adder));
+        }
+    }
+
+    private static <T> JsonElement encode(
+            List<T> items, java.util.function.BiConsumer<JsonArray, T> adder) {
+        if (adder == null) {
+            StringBuilder text = new StringBuilder();
+            new java.util.TreeSet<>(items).forEach(text::append);
+            return new com.google.gson.JsonPrimitive(text.toString());
+        }
+        JsonArray array = new JsonArray();
+        for (T item : items) {
+            adder.accept(array, item);
+        }
+        return array;
     }
 
     private void send(JsonObject msg) {

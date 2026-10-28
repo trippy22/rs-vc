@@ -25,6 +25,9 @@ public final class AudioEngine implements AutoCloseable {
     static final AudioFormat FORMAT = new AudioFormat(48000, 16, 1, true, false);
     private final PlaybackBuffer playback = new PlaybackBuffer();
     private final SpeechActivity microphoneActivity = new SpeechActivity();
+    // Kept across capture restarts so the learned background level survives device changes.
+    private final NoiseGate gate = new NoiseGate();
+    private volatile NoiseGate.Settings gateSettings = NoiseGate.Settings.OFF;
     private final ExecutorService input = executor("RS VC capture");
     private final ExecutorService output = executor("RS VC playback");
     private final ExecutorService devices;
@@ -43,6 +46,7 @@ public final class AudioEngine implements AutoCloseable {
     private volatile AudioDevice<SourceDataLine> speaker;
     private volatile boolean closed;
     private volatile boolean deaf;
+    private volatile IntSupplier frameMillis = () -> 20;
     private long sequence;
 
     interface LineProvider {
@@ -232,9 +236,12 @@ public final class AudioEngine implements AutoCloseable {
                 return;
             }
             device.start();
-            CaptureProcessor processor = new CaptureProcessor(microphoneActivity, suppressSilence);
-            byte[] bytes = new byte[OpusCodec.SAMPLES * 2];
+            CaptureProcessor processor =
+                    new CaptureProcessor(microphoneActivity, suppressSilence, gate);
             while (!closed && epoch == captureEpoch.get()) {
+                // The relay chooses 20 or 40 ms packets; read one packet of audio.
+                int frames = frameMillis.getAsInt() == 40 ? 2 : 1;
+                byte[] bytes = new byte[OpusCodec.SAMPLES * 2 * frames];
                 int offset = 0;
                 while (offset < bytes.length && !closed && epoch == captureEpoch.get()) {
                     int read = device.read(bytes, offset, bytes.length - offset);
@@ -249,26 +256,30 @@ public final class AudioEngine implements AutoCloseable {
                 if (closed || epoch != captureEpoch.get()) {
                     return;
                 }
-                short[] pcm = new short[OpusCodec.SAMPLES];
+                short[] pcm = new short[OpusCodec.SAMPLES * frames];
                 for (int i = 0; i < pcm.length; i++) {
                     pcm[i] = (short) ((bytes[2 * i] & 255) | (bytes[2 * i + 1] << 8));
                 }
-                byte[] encoded =
+                List<CaptureProcessor.Packet> encoded =
                         processor.process(
                                 pcm,
                                 audience.getAsBoolean(),
                                 System.nanoTime() / 1_000_000,
-                                observer);
-                long frameSequence =
-                        sequence++; // Includes omitted frames, so receivers can identify gaps.
+                                observer,
+                                gateSettings);
+                // Counts 20 ms frames, including omitted ones, so receivers can identify gaps.
+                // A pre-roll packet keeps the sequence it was captured with.
+                long frameSequence = sequence;
+                sequence += frames;
                 if (closed || epoch != captureEpoch.get()) {
                     return;
                 }
-                if (encoded != null
-                        && audience.getAsBoolean()
-                        && !closed
-                        && epoch == captureEpoch.get()) {
-                    transmit.accept(VoicePacket.upstream(frameSequence, encoded));
+                for (CaptureProcessor.Packet packet : encoded) {
+                    if (audience.getAsBoolean() && !closed && epoch == captureEpoch.get()) {
+                        transmit.accept(
+                                VoicePacket.upstream(
+                                        frameSequence - packet.framesBefore, packet.opus));
+                    }
                 }
             }
         } catch (Exception e) {
@@ -277,6 +288,7 @@ public final class AudioEngine implements AutoCloseable {
             }
         } finally {
             observer.idle();
+            gate.stopped();
             if (session != null) {
                 session.close();
             }
@@ -357,6 +369,21 @@ public final class AudioEngine implements AutoCloseable {
         } catch (Exception ignored) {
             playback.remove(packet.speaker);
         }
+    }
+
+    /** Voice-activation gate settings, read before each captured packet. */
+    public void gate(NoiseGate.Settings value) {
+        gateSettings = value;
+    }
+
+    /** Current microphone level for the meter, or null while the microphone is not capturing. */
+    public NoiseGate.Level micLevel() {
+        return closed ? null : gate.snapshot(System.nanoTime() / 1_000_000);
+    }
+
+    /** Packet duration in milliseconds (20 or 40), read before each captured packet. */
+    public void frameMillis(IntSupplier value) {
+        frameMillis = value;
     }
 
     public void deafen(boolean value) {

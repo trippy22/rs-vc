@@ -19,6 +19,11 @@ public final class SpeechActivity {
         }
     }
 
+    /** Marks speech decided elsewhere, such as an open voice-activation gate. */
+    public void mark(long nowMillis) {
+        lastActive = nowMillis;
+    }
+
     public boolean active(long nowMillis) {
         long last = lastActive;
         return last != Long.MIN_VALUE && nowMillis >= last && nowMillis - last < HOLD_MILLIS;

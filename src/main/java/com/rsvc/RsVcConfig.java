@@ -1,10 +1,13 @@
 package com.rsvc;
 
+import com.rsvc.audio.NoiseGate;
+
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
 import net.runelite.client.config.Keybind;
 import net.runelite.client.config.Range;
+import net.runelite.client.config.Units;
 
 import java.awt.event.KeyEvent;
 
@@ -33,8 +36,8 @@ public interface RsVcConfig extends Config {
             description =
                     "Push-to-talk requires the key. Voice-activated captures automatically while"
                         + " RuneLite is focused and a listener or local speaking indicator is"
-                        + " available; DTX suppresses silence but noise may transmit. Mute stops"
-                        + " capture. Changing mode keeps your connection and room.")
+                        + " available, and sends only sound above the voice activation level."
+                        + " Mute stops capture. Changing mode keeps your connection and room.")
     default VoiceMode voiceMode() {
         return VoiceMode.PUSH_TO_TALK;
     }
@@ -66,6 +69,32 @@ public interface RsVcConfig extends Config {
             description = "Toggle incoming voice and microphone mute while the game has focus. Works in either voice mode.")
     default Keybind deafenHotkey() {
         return new Keybind(KeyEvent.VK_F9, 0);
+    }
+
+    @ConfigItem(
+            keyName = "voiceActivation",
+            name = "Voice activation level",
+            position = 12,
+            description =
+                    "Voice-activated mode only. Auto learns your background noise and sends sound"
+                        + " about 12 dB above it. Manual sends sound above the threshold below."
+                        + " The sidebar meter shows your mic level and where it opens.")
+    default VoiceActivation voiceActivation() {
+        return VoiceActivation.AUTO;
+    }
+
+    @Range(min = NoiseGate.MIN_MANUAL_DB, max = NoiseGate.MAX_MANUAL_DB)
+    @Units(" dB")
+    @ConfigItem(
+            keyName = "voiceActivationThreshold",
+            name = "Manual threshold",
+            position = 13,
+            description =
+                    "With Manual voice activation, sound quieter than this is not sent. Lower is"
+                        + " more sensitive. Speech is usually -30 to -15 dB; hiss and fans -70 to"
+                        + " -50 dB.")
+    default int voiceActivationThreshold() {
+        return NoiseGate.DEFAULT_MANUAL_DB;
     }
 
     @Range(min = 0, max = 100)

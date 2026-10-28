@@ -2,10 +2,15 @@ package com.rsvc.proximity;
 
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 
-/** Client-thread matching. Unregistered players' tokens are never returned or uploaded. */
+/**
+ * Client-thread matching. Unregistered players' full tokens are never returned or uploaded; only
+ * a 20-bit fingerprint of each visible name leaves the client, shared by many possible names.
+ */
 public final class ProximityMatcher {
     public static final int RANGE = 20;
     private final Map<String, String> cache = new HashMap<>();
@@ -30,32 +35,60 @@ public final class ProximityMatcher {
             int nextWorld,
             Set<String> visibleNames,
             Map<String, Long> registered) {
-        if (!salt.equals(nextSalt) || world != nextWorld) {
-            clear();
-            salt = nextSalt;
-            world = nextWorld;
-        }
+        use(nextSalt, nextWorld);
         Map<String, Long> ids = new HashMap<>();
         if (salt.isEmpty() || registered.isEmpty()) {
             return ids;
         }
         for (String name : visibleNames) {
-            try {
-                String normalized = VoiceIdentity.normalize(name);
-                if (cache.size() >= 2048 && !cache.containsKey(normalized)) {
-                    cache.clear();
-                }
-                String token =
-                        cache.computeIfAbsent(normalized, n -> VoiceIdentity.token(salt, n, world));
-                Long id = registered.get(token);
-                if (id != null) {
-                    ids.put(name, id);
-                }
-            } catch (IllegalArgumentException ignored) {
-                /* An incomplete player name cannot be matched. */
+            String token = token(name);
+            Long id = token == null ? null : registered.get(token);
+            if (id != null) {
+                ids.put(name, id);
             }
         }
         return ids;
+    }
+
+    /** Fingerprints of up to {@code limit} names, in the given (nearest-first) order. */
+    public Set<String> fingerprints(String nextSalt, int nextWorld, List<String> names, int limit) {
+        use(nextSalt, nextWorld);
+        Set<String> result = new TreeSet<>();
+        if (salt.isEmpty()) {
+            return result;
+        }
+        for (String name : names) {
+            if (result.size() >= limit) {
+                break;
+            }
+            String token = token(name);
+            if (token != null) {
+                result.add(token.substring(0, FINGERPRINT_DIGITS));
+            }
+        }
+        return result;
+    }
+
+    public static final int FINGERPRINT_DIGITS = 5;
+
+    private void use(String nextSalt, int nextWorld) {
+        if (!salt.equals(nextSalt) || world != nextWorld) {
+            clear();
+            salt = nextSalt;
+            world = nextWorld;
+        }
+    }
+
+    private String token(String name) {
+        try {
+            String normalized = VoiceIdentity.normalize(name);
+            if (cache.size() >= 2048 && !cache.containsKey(normalized)) {
+                cache.clear();
+            }
+            return cache.computeIfAbsent(normalized, n -> VoiceIdentity.token(salt, n, world));
+        } catch (IllegalArgumentException ignored) {
+            return null; // An incomplete player name cannot be matched.
+        }
     }
 
     public void clear() {
