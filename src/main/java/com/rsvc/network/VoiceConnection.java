@@ -18,7 +18,11 @@ import okio.ByteString;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -111,6 +115,17 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     private volatile List<Peer> peers = Collections.emptyList();
     private volatile Set<Long> blocked = Collections.emptySet();
     private Set<String> mutedAliases = Collections.emptySet();
+
+    // Optional UDP audio path; the WebSocket stays the control channel and audio fallback.
+    static final long UDP_PROBE_INTERVAL = 250_000_000L, UDP_PROBE_WINDOW = 2_500_000_000L;
+    static final long UDP_KEEPALIVE = 5_000_000_000L, UDP_TIMEOUT = 12_000_000_000L;
+    static final long UDP_RETRY = 30_000_000_000L;
+    private URI endpoint;
+    private boolean udpWanted;
+    private UdpAudio udp;
+    private volatile boolean udpActive;
+    // System.nanoTime() values; 0 means unset.
+    private long udpProbeUntil, udpProbedAt, udpAckAt, udpRetryAt;
 
     public static final class RoomState {
         public final String code, reason;
@@ -296,9 +311,146 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         return uri;
     }
 
+    /**
+     * Audio moves to UDP on its own when the relay offers it and the relay is reached without a
+     * proxy, and returns to the WebSocket whenever UDP stops answering.
+     */
     public void connect(OkHttpClient client, String endpoint) {
-        validateEndpoint(endpoint);
+        connect(client, endpoint, true);
+    }
+
+    /** With udp false, audio always stays on the WebSocket. */
+    public void connect(OkHttpClient client, String endpoint, boolean udp) {
+        URI uri = validateEndpoint(endpoint);
+        udpEndpoint(uri, udp && direct(client, uri));
         socket = client.newWebSocket(new Request.Builder().url(endpoint).build(), this);
+    }
+
+    synchronized void udpEndpoint(URI uri, boolean wanted) {
+        endpoint = uri;
+        udpWanted = wanted;
+    }
+
+    /** UDP would bypass RuneLite's proxy, so it is used only when the relay is reached directly. */
+    static boolean direct(OkHttpClient client, URI endpoint) {
+        try {
+            Proxy proxy = client.proxy();
+            if (proxy != null) {
+                return proxy.type() == Proxy.Type.DIRECT;
+            }
+            int port = endpoint.getPort() != -1 ? endpoint.getPort() : 443;
+            for (String scheme : new String[] {"https", "socket"}) {
+                URI target = new URI(scheme, null, endpoint.getHost(), port, null, null, null);
+                for (Proxy selected : client.proxySelector().select(target)) {
+                    if (selected.type() != Proxy.Type.DIRECT) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        } catch (RuntimeException | URISyntaxException e) {
+            return false;
+        }
+    }
+
+    /** True while audio is sent and received over UDP rather than the WebSocket. */
+    public boolean usingUdp() {
+        return udpActive;
+    }
+
+    private void offerUdp(JsonObject offer) {
+        long port = VoiceDirectory.number(offer, "port", 1, 65535);
+        String session = offer.get("session").getAsString(), key = offer.get("key").getAsString();
+        if (!session.matches("[0-9a-f]{16}") || !key.matches("[0-9a-f]{32}")) {
+            throw new IllegalArgumentException();
+        }
+        if (!udpWanted || endpoint == null || udp != null) {
+            return;
+        }
+        try {
+            String host = endpoint.getHost().replace("[", "").replace("]", "");
+            udp = new UdpAudio(
+                    new InetSocketAddress(InetAddress.getByName(host), (int) port),
+                    hex(session),
+                    hex(key),
+                    new UdpAudio.Listener() {
+                        @Override
+                        public void acknowledged() {
+                            udpAcknowledged(System.nanoTime());
+                        }
+
+                        @Override
+                        public void audio(byte[] payload) {
+                            observer.message(false, true, payload.length);
+                            receiveAudio(payload);
+                        }
+                    });
+            udpProbeUntil = System.nanoTime() + UDP_PROBE_WINDOW;
+        } catch (java.io.IOException | java.security.GeneralSecurityException e) {
+            log.debug("RSVC UDP unavailable: {}", e.getClass().getSimpleName());
+        }
+    }
+
+    private static byte[] hex(String text) {
+        byte[] bytes = new byte[text.length() / 2];
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = (byte) Integer.parseInt(text.substring(2 * i, 2 * i + 2), 16);
+        }
+        return bytes;
+    }
+
+    /** Probes until the relay answers, keeps the path alive, and falls back when it stops. */
+    synchronized void udpTick(long now) {
+        if (udp == null || closed) {
+            return;
+        }
+        if (udpActive) {
+            if (now - udpAckAt > UDP_TIMEOUT) {
+                log.debug("RSVC UDP audio stopped; using the WebSocket");
+                udpActive = false;
+                udpRetryAt = now + UDP_RETRY;
+                sendTransport(false);
+            } else if (now - udpProbedAt >= UDP_KEEPALIVE) {
+                probe(now);
+            }
+            return;
+        }
+        if (udpProbeUntil == 0 && udpRetryAt != 0 && now - udpRetryAt >= 0) {
+            udpProbeUntil = now + UDP_PROBE_WINDOW;
+            udpRetryAt = 0;
+        }
+        if (udpProbeUntil == 0) {
+            return;
+        }
+        if (now - udpProbeUntil > 0) {
+            udpProbeUntil = 0;
+            udpRetryAt = now + UDP_RETRY;
+        } else if (udpProbedAt == 0 || now - udpProbedAt >= UDP_PROBE_INTERVAL) {
+            probe(now);
+        }
+    }
+
+    private void probe(long now) {
+        udpProbedAt = now;
+        udp.send(UdpAudio.PROBE, new byte[0]);
+    }
+
+    synchronized void udpAcknowledged(long now) {
+        if (closed || udp == null) {
+            return;
+        }
+        udpAckAt = now;
+        if (!udpActive) {
+            log.debug("RSVC UDP audio path confirmed");
+            udpActive = true;
+            udpProbeUntil = 0;
+            udpRetryAt = 0;
+            sendTransport(true);
+        }
+    }
+
+    private void sendTransport(boolean useUdp) {
+        sendText("{\"type\":\"transport\",\"udp\":" + useUdp + "}");
     }
 
     @Override
@@ -363,6 +515,9 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                     hello.addProperty("keyRotation", true);
                 }
                 send(hello);
+                if (msg.has("udp")) {
+                    offerUdp(msg.getAsJsonObject("udp"));
+                }
                 return;
             }
             if (protocol == 0) {
@@ -438,6 +593,19 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             }
             if ("heartbeat".equals(type)) {
                 heartbeatAckAt = System.nanoTime();
+                return;
+            }
+            if ("transport".equals(type)) {
+                JsonElement value = msg.get("udp");
+                if (udp == null || value == null || !value.isJsonPrimitive()
+                        || !value.getAsJsonPrimitive().isBoolean()) {
+                    throw new IllegalArgumentException();
+                }
+                // The relay refused or dropped UDP: keep audio on the WebSocket and retry later.
+                if (!value.getAsBoolean() && udpActive) {
+                    udpActive = false;
+                    udpRetryAt = System.nanoTime() + UDP_RETRY;
+                }
                 return;
             }
             if ("matches".equals(type)) {
@@ -666,6 +834,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             proximity(salt, "", Collections.emptySet());
         }
         long now = System.nanoTime();
+        udpTick(now);
         sendPeerStatus(now);
         if (salt.isEmpty() || (heartbeatSentAt != 0 && now - heartbeatSentAt < 5_000_000_000L)) {
             return;
@@ -710,6 +879,10 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     public synchronized void transmit(byte[] packet) {
         WebSocket current = socket;
         if (!canTransmit() || current == null) {
+            return;
+        }
+        if (udpActive && udp.send(UdpAudio.AUDIO_UP, packet)) {
+            observer.message(true, true, packet.length);
             return;
         }
         // Skip new audio during temporary TCP congestion instead of building more
@@ -921,6 +1094,10 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         open = false;
         active = false;
         activityAt = 0;
+        udpActive = false;
+        if (udp != null) {
+            udp.close();
+        }
         observer.connected(false);
         WebSocket current = socket;
         if (current != null) {
