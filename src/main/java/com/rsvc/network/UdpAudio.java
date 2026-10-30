@@ -7,7 +7,6 @@ import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.security.GeneralSecurityException;
-import java.security.MessageDigest;
 import java.util.Arrays;
 
 import javax.crypto.Cipher;
@@ -21,7 +20,8 @@ import javax.crypto.spec.SecretKeySpec;
  */
 final class UdpAudio implements AutoCloseable {
     static final int PROBE = 1, AUDIO_UP = 2, PROBE_ACK = 3, AUDIO_DOWN = 4;
-    static final int HEADER = 17, TAG = 16;
+    // Client to relay: kind, session, 64-bit counter. Relay to client: kind, 32-bit counter.
+    static final int HEADER = 17, DOWN_HEADER = 5, TAG = 16;
     static final int TO_RELAY = 0, FROM_RELAY = 1;
 
     interface Listener {
@@ -61,7 +61,7 @@ final class UdpAudio implements AutoCloseable {
             return false;
         }
         try {
-            byte[] datagram = seal(sealer, key, kind, session, ++sent, TO_RELAY, payload);
+            byte[] datagram = seal(sealer, key, kind, session, ++sent, payload);
             socket.send(new DatagramPacket(datagram, datagram.length));
             return true;
         } catch (IOException | GeneralSecurityException e) {
@@ -86,15 +86,15 @@ final class UdpAudio implements AutoCloseable {
             }
             int length = packet.getLength();
             int kind = buffer[0] & 0xff;
-            if (length < HEADER + TAG || (kind != PROBE_ACK && kind != AUDIO_DOWN)) {
+            if (length < DOWN_HEADER + TAG || (kind != PROBE_ACK && kind != AUDIO_DOWN)) {
                 continue;
             }
-            long counter = ByteBuffer.wrap(buffer, 9, 8).getLong();
+            long counter = Integer.toUnsignedLong(ByteBuffer.wrap(buffer, 1, 4).getInt());
             // Replayed and reordered datagrams are dropped; late audio is useless.
-            if (Long.compareUnsigned(counter, received) <= 0) {
+            if (counter <= received) {
                 continue;
             }
-            byte[] payload = open(opener, key, session, buffer, length, FROM_RELAY);
+            byte[] payload = open(opener, key, buffer, length);
             if (payload == null) {
                 continue;
             }
@@ -119,22 +119,17 @@ final class UdpAudio implements AutoCloseable {
         return ByteBuffer.allocate(HEADER).put((byte) kind).put(session).putLong(counter).array();
     }
 
-    private static GCMParameterSpec nonce(int direction, long counter) {
+    static GCMParameterSpec nonce(int direction, long counter) {
         return new GCMParameterSpec(
                 TAG * 8, ByteBuffer.allocate(12).putInt(direction).putLong(counter).array());
     }
 
+    /** A client-to-relay datagram. */
     static byte[] seal(
-            Cipher cipher,
-            SecretKeySpec key,
-            int kind,
-            byte[] session,
-            long counter,
-            int direction,
-            byte[] payload)
+            Cipher cipher, SecretKeySpec key, int kind, byte[] session, long counter, byte[] payload)
             throws GeneralSecurityException {
         byte[] header = header(kind, session, counter);
-        cipher.init(Cipher.ENCRYPT_MODE, key, nonce(direction, counter));
+        cipher.init(Cipher.ENCRYPT_MODE, key, nonce(TO_RELAY, counter));
         cipher.updateAAD(header);
         byte[] sealed = cipher.doFinal(payload);
         byte[] datagram = Arrays.copyOf(header, HEADER + sealed.length);
@@ -142,20 +137,21 @@ final class UdpAudio implements AutoCloseable {
         return datagram;
     }
 
-    /** The payload, or null when the datagram is for another session or fails authentication. */
-    static byte[] open(
-            Cipher cipher, SecretKeySpec key, byte[] session, byte[] data, int length, int direction) {
-        if (length < HEADER + TAG
-                || !MessageDigest.isEqual(Arrays.copyOfRange(data, 1, 9), session)) {
+    /**
+     * The payload of a relay-to-client datagram, or null when it fails authentication. The
+     * connected socket already identifies the session, so the header carries no session ID.
+     */
+    static byte[] open(Cipher cipher, SecretKeySpec key, byte[] data, int length) {
+        if (length < DOWN_HEADER + TAG) {
             return null;
         }
         try {
             cipher.init(
                     Cipher.DECRYPT_MODE,
                     key,
-                    nonce(direction, ByteBuffer.wrap(data, 9, 8).getLong()));
-            cipher.updateAAD(data, 0, HEADER);
-            return cipher.doFinal(data, HEADER, length - HEADER);
+                    nonce(FROM_RELAY, Integer.toUnsignedLong(ByteBuffer.wrap(data, 1, 4).getInt())));
+            cipher.updateAAD(data, 0, DOWN_HEADER);
+            return cipher.doFinal(data, DOWN_HEADER, length - DOWN_HEADER);
         } catch (GeneralSecurityException e) {
             return null;
         }
