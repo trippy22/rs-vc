@@ -112,7 +112,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
 
                 @Override
                 public boolean auto() {
-                    return config.voiceActivation() == VoiceActivation.AUTO;
+                    return config.voiceActivation() == ActivationLevel.AUTO;
                 }
 
                 @Override
@@ -1001,7 +1001,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         try {
             Map<String, Long> matches =
                     matcher.matchNames(
-                            salt, client.getWorld(), namedPlayers.keySet(), current.directory());
+                            salt, client.getWorld(), namedPlayers.keySet(), current.introductions());
             Set<Long> nearby = new HashSet<>();
             matchedPlayers.clear();
             matches.forEach(

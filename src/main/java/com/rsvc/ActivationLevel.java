@@ -1,11 +1,12 @@
 package com.rsvc;
 
-public enum VoiceActivation {
+/** How the voice-activated gate picks its threshold; config key {@code voiceActivation}. */
+public enum ActivationLevel {
     AUTO("Auto"),
     MANUAL("Manual");
     private final String label;
 
-    VoiceActivation(String label) {
+    ActivationLevel(String label) {
         this.label = label;
     }
 
