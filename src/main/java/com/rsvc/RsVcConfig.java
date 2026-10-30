@@ -79,8 +79,8 @@ public interface RsVcConfig extends Config {
                     "Voice-activated mode only. Auto learns your background noise and sends sound"
                         + " about 12 dB above it. Manual sends sound above the threshold below."
                         + " The sidebar meter shows your mic level and where it opens.")
-    default VoiceActivation voiceActivation() {
-        return VoiceActivation.AUTO;
+    default ActivationLevel voiceActivation() {
+        return ActivationLevel.AUTO;
     }
 
     @Range(min = NoiseGate.MIN_MANUAL_DB, max = NoiseGate.MAX_MANUAL_DB)

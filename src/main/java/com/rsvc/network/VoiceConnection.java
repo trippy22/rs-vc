@@ -76,8 +76,9 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     private String token = "";
     private volatile String salt = "";
     public static final int MAX_SEEN = 255;
-    private volatile Map<String, Long> directory = Collections.emptyMap();
-    private final VoiceDirectory pagedDirectory = new VoiceDirectory();
+    // Introduced peers by matching token; replaced whole on each change.
+    private volatile Map<String, Long> introduced = Collections.emptyMap();
+    private final PeerIntroductions introductions = new PeerIntroductions();
     private int protocol;
     private volatile int frameMillis = 20;
     private long keyEpoch;
@@ -359,7 +360,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     }
 
     private void offerUdp(JsonObject offer) {
-        long port = VoiceDirectory.number(offer, "port", 1, 65535);
+        long port = ControlJson.number(offer, "port", 1, 65535);
         String session = offer.get("session").getAsString(), key = offer.get("key").getAsString();
         if (!session.matches("[0-9a-f]{16}") || !key.matches("[0-9a-f]{32}")) {
             throw new IllegalArgumentException();
@@ -483,20 +484,20 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             JsonObject msg = gson.fromJson(text, JsonObject.class);
             String type = msg.get("type").getAsString();
             if ("welcome".equals(type)) {
-                int version = (int) VoiceDirectory.number(msg, "v", 8, 8);
+                int version = (int) ControlJson.number(msg, "v", 8, 8);
                 String key = msg.get("salt").getAsString();
                 if (!key.matches("[0-9a-f]{64}") || !salt.isEmpty()) {
                     throw new IllegalArgumentException();
                 }
                 keyEpoch =
                         msg.has("keyEpoch")
-                                ? VoiceDirectory.number(msg, "keyEpoch", 1, 9007199254740991L)
+                                ? ControlJson.number(msg, "keyEpoch", 1, 9007199254740991L)
                                 : 0;
                 if (msg.has("id")) {
-                    selfId = VoiceDirectory.number(msg, "id", 1, 0xffffffffL);
+                    selfId = ControlJson.number(msg, "id", 1, 0xffffffffL);
                 }
                 if (msg.has("frameMs")) {
-                    long frame = VoiceDirectory.number(msg, "frameMs", 20, 40);
+                    long frame = ControlJson.number(msg, "frameMs", 20, 40);
                     if (frame != 20 && frame != 40) {
                         throw new IllegalArgumentException();
                     }
@@ -525,7 +526,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             }
             if ("matching_key".equals(type)) {
                 long epoch =
-                        VoiceDirectory.number(msg, "keyEpoch", keyEpoch + 1, 9007199254740991L);
+                        ControlJson.number(msg, "keyEpoch", keyEpoch + 1, 9007199254740991L);
                 String key = msg.get("salt").getAsString();
                 if (keyEpoch == 0 || !key.matches("[0-9a-f]{64}") || key.equals(salt)) {
                     throw new IllegalArgumentException();
@@ -535,7 +536,6 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                 resendLists = true;
                 salt = key;
                 // Existing routing/audio stays valid; only fresh local matching may send state.
-                // Pending directory pages and their ACKs remain ordered on this socket.
                 return;
             }
             if ("room".equals(type)) {
@@ -544,7 +544,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                 }
                 String code = msg.get("code").getAsString(),
                         reason = msg.get("reason").getAsString();
-                long expiresAt = VoiceDirectory.number(msg, "expiresAt", 0, 9007199254740991L);
+                long expiresAt = ControlJson.number(msg, "expiresAt", 0, 9007199254740991L);
                 if ((!code.isEmpty() && !code.matches("[0-9a-f]{24}"))
                         || !java.util.Arrays.asList(
                                         "created",
@@ -609,8 +609,8 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                 return;
             }
             if ("matches".equals(type)) {
-                pagedDirectory.accept(msg);
-                directory = pagedDirectory.identities();
+                introductions.accept(msg);
+                introduced = introductions.identities();
                 return;
             }
             if (!"peers".equals(type)) {
@@ -626,7 +626,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             int audience = msg.get("listeners").getAsInt();
             JsonArray array = msg.getAsJsonArray("peers");
             // Rosters only name peers this client was introduced to.
-            if (array.size() > VoiceDirectory.MAX_ENTRIES
+            if (array.size() > PeerIntroductions.MAX_ENTRIES
                     || audience < 0
                     || audience > array.size()) {
                 throw new IllegalArgumentException();
@@ -726,8 +726,9 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         return frameMillis;
     }
 
-    public Map<String, Long> directory() {
-        return directory;
+    /** Relay IDs of introduced peers, keyed by their matching tokens. */
+    public Map<String, Long> introductions() {
+        return introduced;
     }
 
     public synchronized void mutedAliases(Set<String> aliases) {
