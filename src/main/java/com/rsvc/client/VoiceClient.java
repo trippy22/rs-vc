@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.LongSupplier;
+import java.util.function.LongUnaryOperator;
 
 /**
  * Voice-session ownership, recovery and game-presence policy, independent of RuneLite and Swing.
@@ -33,7 +34,8 @@ public final class VoiceClient {
         void room(VoiceConnection source, VoiceConnection.RoomState state);
     }
 
-    private final LongSupplier nanoTime, jitterMillis;
+    private final LongSupplier nanoTime;
+    private final LongUnaryOperator jitterMillis;
     private final ReconnectPolicy reconnect = new ReconnectPolicy();
     private final GameVoiceSession game = new GameVoiceSession();
     private volatile VoiceConnection connection;
@@ -47,12 +49,21 @@ public final class VoiceClient {
     private int world;
 
     public VoiceClient() {
-        this(System::nanoTime, () -> ThreadLocalRandom.current().nextLong(500));
+        this(System::nanoTime, bound -> ThreadLocalRandom.current().nextLong(bound));
     }
 
-    VoiceClient(LongSupplier nanoTime, LongSupplier jitterMillis) {
+    VoiceClient(LongSupplier nanoTime, LongUnaryOperator jitterMillis) {
         this.nanoTime = nanoTime;
         this.jitterMillis = jitterMillis;
+    }
+
+    /**
+     * Retries wait a random extra amount below this. A relay restart drops every client at once;
+     * spreading the first retry over two seconds instead of half of one keeps the handshakes from
+     * landing together. Later retries spread over their own backoff step, up to five seconds.
+     */
+    static long jitterBoundMillis(long delay) {
+        return Math.max(2000, Math.min(delay, 5000));
     }
 
     public VoiceConnection connection() { return connection; }
@@ -125,7 +136,8 @@ public final class VoiceClient {
             if (reason == DisconnectReason.ALIAS_IN_USE) {
                 alias = VoiceAlias.replacement(alias);
             }
-            retryAt = nanoTime.getAsLong() + (delay + jitterMillis.getAsLong()) * 1_000_000;
+            long jitter = jitterMillis.applyAsLong(jitterBoundMillis(delay));
+            retryAt = nanoTime.getAsLong() + (delay + jitter) * 1_000_000;
         }
         return delay;
     }

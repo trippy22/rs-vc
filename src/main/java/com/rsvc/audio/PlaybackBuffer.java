@@ -30,12 +30,10 @@ public final class PlaybackBuffer {
 
     private static final class Frame {
         final byte[] opus; // Null for a lost frame the decoder must conceal.
-        final float gain;
         final int frames;
 
-        Frame(byte[] opus, float gain, int frames) {
+        Frame(byte[] opus, int frames) {
             this.opus = opus;
-            this.gain = gain;
             this.frames = frames;
         }
     }
@@ -45,11 +43,9 @@ public final class PlaybackBuffer {
         final ArrayDeque<Frame> queue = new ArrayDeque<>();
         int queuedFrames;
         short[] carry; // Second half of a decoded 40 ms packet; counted in queuedFrames.
-        float carryGain;
         long receivedAt;
         long sequence = -1;
         int packetFrames = 1;
-        float gain;
         int concealed;
         boolean primed;
         final SpeechActivity activity = new SpeechActivity();
@@ -101,16 +97,15 @@ public final class PlaybackBuffer {
                 stream.reset();
             } else {
                 for (long n = 0; n < missing; n++) {
-                    stream.queue.add(new Frame(null, stream.gain, 1));
+                    stream.queue.add(new Frame(null, 1));
                     stream.queuedFrames++;
                 }
             }
         }
         stream.sequence = packet.sequence;
         stream.packetFrames = frames;
-        stream.gain = packet.gain;
         stream.receivedAt = now;
-        stream.queue.add(new Frame(packet.opus, packet.gain, frames));
+        stream.queue.add(new Frame(packet.opus, frames));
         stream.queuedFrames += frames;
         // Never play a growing backlog of old speech after TCP stalls. Keep the newest
         // audio at the priming depth instead of discarding everything and re-priming.
@@ -145,11 +140,9 @@ public final class PlaybackBuffer {
                 continue;
             }
             short[] pcm;
-            float packetGain;
             boolean real;
             if (stream.carry != null) {
                 pcm = stream.carry;
-                packetGain = stream.carryGain;
                 real = true;
                 stream.carry = null;
                 stream.queuedFrames--;
@@ -166,7 +159,7 @@ public final class PlaybackBuffer {
                         continue;
                     }
                     stream.concealed++;
-                    frame = new Frame(null, stream.gain, 1);
+                    frame = new Frame(null, 1);
                 } else {
                     stream.queuedFrames -= frame.frames;
                 }
@@ -175,7 +168,6 @@ public final class PlaybackBuffer {
                 if (real) {
                     stream.concealed = 0;
                 }
-                packetGain = frame.gain;
                 try {
                     short[] decoded = new short[frame.frames * OpusCodec.SAMPLES];
                     int size =
@@ -198,7 +190,6 @@ public final class PlaybackBuffer {
                         stream.carry =
                                 java.util.Arrays.copyOfRange(
                                         decoded, OpusCodec.SAMPLES, decoded.length);
-                        stream.carryGain = packetGain;
                         stream.queuedFrames++;
                     } else {
                         pcm = decoded;
@@ -209,8 +200,7 @@ public final class PlaybackBuffer {
                 }
             }
             float gain =
-                    packetGain
-                            * Math.max(0, Math.min(100, volume))
+                    Math.max(0, Math.min(100, volume))
                             / 100f
                             * Math.max(0, Math.min(200, volumes.getOrDefault(entry.getKey(), 100)))
                             / 100f;

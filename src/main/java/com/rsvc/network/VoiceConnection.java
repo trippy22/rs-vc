@@ -483,7 +483,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             JsonObject msg = gson.fromJson(text, JsonObject.class);
             String type = msg.get("type").getAsString();
             if ("welcome".equals(type)) {
-                int version = (int) VoiceDirectory.number(msg, "v", 7, 7);
+                int version = (int) VoiceDirectory.number(msg, "v", 8, 8);
                 String key = msg.get("salt").getAsString();
                 if (!key.matches("[0-9a-f]{64}") || !salt.isEmpty()) {
                     throw new IllegalArgumentException();
