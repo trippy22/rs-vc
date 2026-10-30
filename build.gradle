@@ -14,9 +14,6 @@ repositories {
 
 def runeLiteVersion = 'latest.release'
 dependencies {
-    implementation('io.github.jaredmdobson:concentus:1.0.2') {
-        transitive = false
-    }
     compileOnly "net.runelite:client:${runeLiteVersion}"
     testImplementation "net.runelite:client:${runeLiteVersion}"
     testImplementation 'junit:junit:4.13.2'
@@ -31,25 +28,6 @@ tasks.withType(JavaCompile).configureEach {
 
 test {
     useJUnit()
-}
-
-// Exact artifact approved by the user. Verification is build-time only.
-tasks.register('verifyConcentus') {
-    inputs.files(configurations.runtimeClasspath)
-    doLast {
-        def codec = configurations.runtimeClasspath.files.findAll { it.name == 'concentus-1.0.2.jar' }
-        if (codec.size() != 1) {
-            throw new GradleException('Expected exactly Concentus 1.0.2')
-        }
-        def digest = java.security.MessageDigest.getInstance('SHA-256')
-            .digest(codec.first().bytes).encodeHex().toString()
-        if (digest != '3584da8a1ac7e0814a03ce3c1b1e70250bf7b07668bc39eea1048796d6471ce3') {
-            throw new GradleException('Concentus differs from the approved artifact; do not bypass verification')
-        }
-    }
-}
-tasks.named('compileJava') {
-    dependsOn 'verifyConcentus'
 }
 
 tasks.register('run', JavaExec) {

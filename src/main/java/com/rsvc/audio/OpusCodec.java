@@ -1,12 +1,8 @@
 package com.rsvc.audio;
 
+import com.rsvc.codec.VoiceDecoder;
+import com.rsvc.codec.VoiceEncoder;
 import com.rsvc.network.VoicePacket;
-
-import io.github.jaredmdobson.concentus.OpusApplication;
-import io.github.jaredmdobson.concentus.OpusDecoder;
-import io.github.jaredmdobson.concentus.OpusEncoder;
-import io.github.jaredmdobson.concentus.OpusException;
-import io.github.jaredmdobson.concentus.OpusSignal;
 
 import java.util.Arrays;
 
@@ -17,21 +13,16 @@ public final class OpusCodec {
 
     private OpusCodec() {}
 
-    public static OpusEncoder encoder() throws OpusException {
+    public static VoiceEncoder encoder() {
         return encoder(true);
     }
 
-    public static OpusEncoder encoder(boolean suppressSilence) throws OpusException {
-        OpusEncoder encoder = new OpusEncoder(RATE, 1, OpusApplication.OPUS_APPLICATION_VOIP);
-        encoder.setBitrate(BITRATE);
-        encoder.setSignalType(OpusSignal.OPUS_SIGNAL_VOICE);
-        encoder.setComplexity(4);
-        encoder.setUseDTX(suppressSilence);
-        return encoder;
+    public static VoiceEncoder encoder(boolean suppressSilence) {
+        return new VoiceEncoder(BITRATE, suppressSilence);
     }
 
-    public static OpusDecoder decoder() throws OpusException {
-        return new OpusDecoder(RATE, 1);
+    public static VoiceDecoder decoder() {
+        return new VoiceDecoder();
     }
 
     // Opus DTX emits a TOC-only/very small packet when there is nothing to transmit.
@@ -40,9 +31,9 @@ public final class OpusCodec {
         return packet.length <= 2;
     }
 
-    public static byte[] encode(OpusEncoder encoder, short[] pcm) throws OpusException {
+    public static byte[] encode(VoiceEncoder encoder, short[] pcm) {
         byte[] out = new byte[VoicePacket.MAX_OPUS];
-        int size = encoder.encode(pcm, 0, pcm.length, out, 0, out.length);
+        int size = encoder.encode(pcm, out);
         return Arrays.copyOf(out, size);
     }
 }

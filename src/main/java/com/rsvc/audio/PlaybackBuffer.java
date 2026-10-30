@@ -1,10 +1,7 @@
 package com.rsvc.audio;
 
+import com.rsvc.codec.VoiceDecoder;
 import com.rsvc.network.VoicePacket;
-
-import io.github.jaredmdobson.concentus.OpusDecoder;
-import io.github.jaredmdobson.concentus.OpusException;
-import io.github.jaredmdobson.concentus.OpusPacketInfo;
 
 import java.util.ArrayDeque;
 import java.util.HashMap;
@@ -39,7 +36,7 @@ public final class PlaybackBuffer {
     }
 
     private static final class Stream {
-        OpusDecoder decoder = OpusCodec.decoder();
+        VoiceDecoder decoder = OpusCodec.decoder();
         final ArrayDeque<Frame> queue = new ArrayDeque<>();
         int queuedFrames;
         short[] carry; // Second half of a decoded 40 ms packet; counted in queuedFrames.
@@ -50,9 +47,7 @@ public final class PlaybackBuffer {
         boolean primed;
         final SpeechActivity activity = new SpeechActivity();
 
-        Stream() throws OpusException {}
-
-        void reset() throws OpusException {
+        void reset() {
             decoder = OpusCodec.decoder();
             queue.clear();
             queuedFrames = 0;
@@ -71,7 +66,7 @@ public final class PlaybackBuffer {
         }
     }
 
-    public synchronized void offer(VoicePacket packet, long now) throws OpusException {
+    public synchronized void offer(VoicePacket packet, long now) {
         int frames = frames(packet.opus);
         if (frames == 0) {
             // Only 20 and 40 ms packets are played, even if a hostile relay supplies valid Opus.
@@ -117,16 +112,8 @@ public final class PlaybackBuffer {
     }
 
     private static int frames(byte[] opus) {
-        try {
-            int samples = OpusPacketInfo.getNumSamples(opus, 0, opus.length, OpusCodec.RATE);
-            if (samples == OpusCodec.SAMPLES || samples == 2 * OpusCodec.SAMPLES) {
-                return samples / OpusCodec.SAMPLES;
-            }
-        } catch (RuntimeException ignored) {
-            // Malformed packets (negative counts or parser errors) are dropped like
-            // unsupported durations.
-        }
-        return 0;
+        // Zero for anything but the codec's own SILK-only wideband mono packets.
+        return VoiceDecoder.samples(opus) / OpusCodec.SAMPLES;
     }
 
     public synchronized short[] mix(long now, int volume) {
@@ -170,18 +157,7 @@ public final class PlaybackBuffer {
                 }
                 try {
                     short[] decoded = new short[frame.frames * OpusCodec.SAMPLES];
-                    int size =
-                            real
-                                    ? stream.decoder.decode(
-                                            frame.opus,
-                                            0,
-                                            frame.opus.length,
-                                            decoded,
-                                            0,
-                                            decoded.length,
-                                            false)
-                                    : stream.decoder.decode(
-                                            null, 0, 0, decoded, 0, decoded.length, false);
+                    int size = stream.decoder.decode(frame.opus, decoded);
                     if (size != decoded.length) {
                         continue;
                     }
@@ -194,7 +170,7 @@ public final class PlaybackBuffer {
                     } else {
                         pcm = decoded;
                     }
-                } catch (OpusException | RuntimeException ignored) {
+                } catch (RuntimeException ignored) {
                     iter.remove();
                     continue;
                 }

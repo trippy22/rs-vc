@@ -1,9 +1,7 @@
 package com.rsvc.audio;
 
 import com.rsvc.VoiceObserver;
-
-import io.github.jaredmdobson.concentus.OpusEncoder;
-import io.github.jaredmdobson.concentus.OpusException;
+import com.rsvc.codec.VoiceEncoder;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -25,7 +23,7 @@ final class CaptureProcessor {
     private final SpeechActivity activity;
     private final boolean suppressSilence;
     private final NoiseGate gate;
-    private OpusEncoder encoder;
+    private VoiceEncoder encoder;
     // The packet captured just before the gate opened; sent first so word onsets survive.
     private short[] preRoll;
 
@@ -45,8 +43,7 @@ final class CaptureProcessor {
             boolean audience,
             long nowMillis,
             VoiceObserver observer,
-            NoiseGate.Settings settings)
-            throws OpusException {
+            NoiseGate.Settings settings) {
         boolean admitted = gate.admit(pcm, nowMillis, settings);
         if (settings.enabled()) {
             // The local indicator shows what voice activation would send.
@@ -87,7 +84,7 @@ final class CaptureProcessor {
         return packets;
     }
 
-    private byte[] encode(short[] pcm, VoiceObserver observer) throws OpusException {
+    private byte[] encode(short[] pcm, VoiceObserver observer) {
         byte[] encoded = OpusCodec.encode(encoder, pcm);
         boolean suppressed = suppressSilence && OpusCodec.suppress(encoded);
         observer.encoded(encoded.length, suppressed);
