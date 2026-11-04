@@ -17,8 +17,8 @@ Use **Disconnect** to stop voice and **Connect** to rejoin.
 ## Nearby voice
 
 Talk to connected plugin users within **20 tiles**, on the **same world and floor**.
-Nearby voice uses groups of up to **25** in the same map region. Busy regions
-split into separate groups, so you may not hear everyone nearby.
+You hear up to **24** voice users at once. People you hear stay connected while
+they're in range; in a bigger crowd, others wait for a free slot.
 
 The **Voices** list uses random aliases. Green bubbles show who's speaking.
 When alone, your mic indicator can still react, but no audio is uploaded.

@@ -344,8 +344,8 @@ public final class VoicePanel extends PluginPanel {
                         : partyVoice
                         ? "Exclusive party voice; nearby and private-room audio are off"
                         : roomCode.isEmpty()
-                                ? "Within 20 tiles, same world, floor and region; up to 25 per"
-                                      + " group"
+                                ? "Within 20 tiles on the same world and floor; up to 24 at"
+                                      + " once, kept while in range"
                                 : "Room members only, regardless of distance, world or floor");
     }
 

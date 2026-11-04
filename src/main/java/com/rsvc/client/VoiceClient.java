@@ -210,24 +210,17 @@ public final class VoiceClient {
 
     public void stopParty() { partySelected = false; }
 
-    public void position(String salt, String name, int world, Set<Long> nearby, int region, int plane) {
-        position(salt, name, world, nearby, region, plane, Collections.emptySet());
+    public void position(String salt, String name, int world, Set<Long> nearby) {
+        position(salt, name, world, nearby, Collections.emptySet());
     }
 
-    public void position(
-            String salt,
-            String name,
-            int world,
-            Set<Long> nearby,
-            int region,
-            int plane,
-            Set<String> seen) {
+    public void position(String salt, String name, int world, Set<Long> nearby, Set<String> seen) {
         VoiceConnection current = connection;
         if (current == null) {
             return;
         }
         String token = VoiceIdentity.token(salt, name, world);
-        String regionToken = VoiceIdentity.region(salt, world, region, plane);
+        String worldKey = VoiceIdentity.worldKey(salt, world);
         character = name;
         this.world = world;
         identitySalt = salt;
@@ -235,7 +228,7 @@ public final class VoiceClient {
         eligible = true;
         eligibleAt = nanoTime.getAsLong();
         game.positionUpdated(eligibleAt);
-        current.proximity(salt, token, nearby, regionToken, seen);
+        current.proximity(salt, token, nearby, worldKey, seen);
     }
 
     public GameUpdate gameState(GameState state, boolean playerAvailable) {

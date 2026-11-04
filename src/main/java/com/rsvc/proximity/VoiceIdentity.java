@@ -32,19 +32,15 @@ public final class VoiceIdentity {
         return digest(salt, "rs-vc-4\n" + world + "\n" + normalized);
     }
 
-    /** Opaque region bucket, not encryption: the relay can enumerate possible regions. */
-    public static String region(String salt, int world, int region, int plane) {
-        if (salt == null
-                || !salt.matches("[0-9a-f]{64}")
-                || world < 1
-                || world > 65535
-                || region < 0
-                || region > 65535
-                || plane < 0
-                || plane > 3) {
+    /**
+     * Opaque world key for nearby discovery, not encryption: the relay can enumerate worlds. It
+     * carries no map location, so region borders never separate nearby players.
+     */
+    public static String worldKey(String salt, int world) {
+        if (salt == null || !salt.matches("[0-9a-f]{64}") || world < 1 || world > 65535) {
             throw new IllegalArgumentException("Invalid proximity context");
         }
-        return digest(salt, "rs-vc-region-1\n" + world + "\n" + region + "\n" + plane);
+        return digest(salt, "rs-vc-world-1\n" + world);
     }
 
     private static String digest(String salt, String context) {

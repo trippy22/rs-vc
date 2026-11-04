@@ -155,7 +155,7 @@ public final class PartyVoice {
             stop();
             return;
         }
-        if ("unavailable".equals(reason) || "expired".equals(reason)) {
+        if ("unavailable".equals(reason)) {
             String failed =
                     pending != null && "join".equals(pending.action) ? pending.code : confirmed;
             if (!failed.isEmpty()) {

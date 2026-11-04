@@ -414,7 +414,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                 }
                 AudioEngine current = audio;
                 if (current != null && (!voice.roomCode().equals(state.code)
-                        || "expired".equals(state.reason) || "unavailable".equals(state.reason))) {
+                        || "unavailable".equals(state.reason))) {
                     current.clearPlayback();
                 }
                 clientThread.invokeLater(() -> applyRoom(source, state));
@@ -498,7 +498,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             status(party ? "Party voice room full — try again later" : "Room full — try again later");
             return;
         }
-        if (changed || "expired".equals(state.reason) || "unavailable".equals(state.reason)) {
+        if (changed || "unavailable".equals(state.reason)) {
             release();
         }
         if (voice.partySelected()) {
@@ -509,9 +509,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         if (panel != null) {
             panel.roomState(state.code, "created".equals(state.reason));
         }
-        if ("expired".equals(state.reason)) {
-            status("Room expired");
-        } else if ("unavailable".equals(state.reason)) {
+        if ("unavailable".equals(state.reason)) {
             status("Room unavailable — current voice selection unchanged");
         } else if ("created".equals(state.reason)) {
             status("Room created — Room → Share code");
@@ -972,7 +970,6 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         }
         WorldPoint origin = self.getWorldLocation();
         Map<String, Player> namedPlayers = new HashMap<>();
-        Set<String> nearbyNames = new HashSet<>();
         List<Player> inRange = new ArrayList<>();
         for (Player player : visiblePlayers) {
             if (player == self || player.getName() == null || player.getWorldView() != view) {
@@ -991,7 +988,6 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                     point.getPlane(),
                     true)) {
                 namedPlayers.put(player.getName(), player);
-                nearbyNames.add(player.getName());
                 inRange.add(player);
             } else if (current.inRoom()) {
                 // A room member may be visible outside the ordinary proximity radius.
@@ -1002,25 +998,23 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             Map<String, Long> matches =
                     matcher.matchNames(
                             salt, client.getWorld(), namedPlayers.keySet(), current.introductions());
-            Set<Long> nearby = new HashSet<>();
             matchedPlayers.clear();
-            matches.forEach(
-                    (name, id) -> {
-                        matchedPlayers.put(id, namedPlayers.get(name));
-                        if (nearbyNames.contains(name)) {
-                            nearby.add(id);
-                        }
-                    });
-            // Nearest first, so a crowd beyond the cap keeps the closest characters.
+            matches.forEach((name, id) -> matchedPlayers.put(id, namedPlayers.get(name)));
+            // Nearest first, so a crowd beyond either cap keeps the closest characters.
             inRange.sort(Comparator.comparingInt(p -> p.getWorldLocation().distanceTo(origin)));
+            // Every confirmed peer in range; the relay decides who shares audio.
+            Set<Long> nearby = new HashSet<>();
             List<String> names = new ArrayList<>();
             for (Player player : inRange) {
                 names.add(player.getName());
+                Long id = matches.get(player.getName());
+                if (id != null && nearby.size() < VoiceConnection.MAX_SEEN) {
+                    nearby.add(id);
+                }
             }
             Set<String> seen =
                     matcher.fingerprints(salt, client.getWorld(), names, VoiceConnection.MAX_SEEN);
-            voice.position(salt, self.getName(), client.getWorld(), nearby,
-                    origin.getRegionID(), origin.getPlane(), seen);
+            voice.position(salt, self.getName(), client.getWorld(), nearby, seen);
             if (!current.inRoom()) {
                 for (VoiceConnection.Peer peer : peers) {
                     if (!nearby.contains(peer.id) && audio != null) {

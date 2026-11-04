@@ -83,10 +83,8 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     private volatile int frameMillis = 20;
     private long keyEpoch;
     private boolean refreshingKey;
-    private boolean roomsSupported, roomPending;
-    private boolean proximityRoomsSupported;
-    private String region = "";
-    private boolean peerStatusSupported;
+    private boolean roomPending;
+    private String world = "";
     private boolean selfMuted, selfDeaf;
     private boolean peerStatusDirty = true;
     private String lastPeerStatus = "";
@@ -130,13 +128,11 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
 
     public static final class RoomState {
         public final String code, reason;
-        public final long expiresAt;
         public final boolean restorationFailed;
 
-        RoomState(String code, String reason, long expiresAt, boolean restorationFailed) {
+        RoomState(String code, String reason, boolean restorationFailed) {
             this.code = code;
             this.reason = reason;
-            this.expiresAt = expiresAt;
             this.restorationFailed = restorationFailed;
         }
     }
@@ -208,7 +204,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     }
 
     public synchronized boolean roomsAvailable() {
-        return roomsSupported && activeConnection() && !roomPending;
+        return protocol != 0 && activeConnection() && !roomPending;
     }
 
     public synchronized void room(String action, String code) {
@@ -484,37 +480,24 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             JsonObject msg = gson.fromJson(text, JsonObject.class);
             String type = msg.get("type").getAsString();
             if ("welcome".equals(type)) {
-                int version = (int) ControlJson.number(msg, "v", 8, 8);
+                int version = (int) ControlJson.number(msg, "v", 9, 9);
                 String key = msg.get("salt").getAsString();
                 if (!key.matches("[0-9a-f]{64}") || !salt.isEmpty()) {
                     throw new IllegalArgumentException();
                 }
-                keyEpoch =
-                        msg.has("keyEpoch")
-                                ? ControlJson.number(msg, "keyEpoch", 1, 9007199254740991L)
-                                : 0;
-                if (msg.has("id")) {
-                    selfId = ControlJson.number(msg, "id", 1, 0xffffffffL);
+                keyEpoch = ControlJson.number(msg, "keyEpoch", 1, 9007199254740991L);
+                selfId = ControlJson.number(msg, "id", 1, 0xffffffffL);
+                long frame = ControlJson.number(msg, "frameMs", 20, 40);
+                if (frame != 20 && frame != 40) {
+                    throw new IllegalArgumentException();
                 }
-                if (msg.has("frameMs")) {
-                    long frame = ControlJson.number(msg, "frameMs", 20, 40);
-                    if (frame != 20 && frame != 40) {
-                        throw new IllegalArgumentException();
-                    }
-                    frameMillis = (int) frame;
-                }
+                frameMillis = (int) frame;
                 protocol = version;
                 salt = key;
-                roomsSupported = msg.has("rooms") && msg.get("rooms").getAsBoolean();
-                peerStatusSupported = optionalBoolean(msg, "peerStatus");
-                proximityRoomsSupported = optionalBoolean(msg, "proximityRooms");
                 JsonObject hello = new JsonObject();
                 hello.addProperty("type", "hello");
                 hello.addProperty("v", protocol);
                 hello.addProperty("alias", name);
-                if (keyEpoch != 0) {
-                    hello.addProperty("keyRotation", true);
-                }
                 send(hello);
                 if (msg.has("udp")) {
                     offerUdp(msg.getAsJsonObject("udp"));
@@ -528,7 +511,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                 long epoch =
                         ControlJson.number(msg, "keyEpoch", keyEpoch + 1, 9007199254740991L);
                 String key = msg.get("salt").getAsString();
-                if (keyEpoch == 0 || !key.matches("[0-9a-f]{64}") || key.equals(salt)) {
+                if (!key.matches("[0-9a-f]{64}") || key.equals(salt)) {
                     throw new IllegalArgumentException();
                 }
                 keyEpoch = epoch;
@@ -539,19 +522,14 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                 return;
             }
             if ("room".equals(type)) {
-                if (!roomsSupported) {
-                    throw new IllegalArgumentException();
-                }
                 String code = msg.get("code").getAsString(),
                         reason = msg.get("reason").getAsString();
-                long expiresAt = ControlJson.number(msg, "expiresAt", 0, 9007199254740991L);
                 if ((!code.isEmpty() && !code.matches("[0-9a-f]{24}"))
                         || !java.util.Arrays.asList(
                                         "created",
                                         "joined",
                                         "left",
                                         "updated",
-                                        "expired",
                                         "full",
                                         "unavailable")
                                 .contains(reason)) {
@@ -574,17 +552,8 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                     if (!restorationFailed) {
                         recoveryRoom = "";
                     }
-                } else if ("expired".equals(reason) && !previousRoom.isEmpty() && requiredRoom == null) {
-                    recoveryRoom = previousRoom;
-                    failedRoomRecovery = restorationFailed = true;
                 }
-                roomListener.accept(new RoomState(code, reason, expiresAt, restorationFailed));
-                if ("expired".equals(reason)) {
-                    JsonObject ack = new JsonObject();
-                    ack.addProperty("type", "room");
-                    ack.addProperty("action", "acknowledge");
-                    send(ack);
-                }
+                roomListener.accept(new RoomState(code, reason, restorationFailed));
                 if (!"updated".equals(reason)) {
                     roomPending = false;
                 }
@@ -747,19 +716,14 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
 
     /** Called only with locally matched consenting voice IDs, never arbitrary player hashes. */
     public synchronized void proximity(String matchingKey, String identity, Set<Long> ids) {
-        proximity(matchingKey, identity, ids, "");
-    }
-
-    public synchronized void proximity(
-            String matchingKey, String identity, Set<Long> ids, String regionKey) {
-        proximity(matchingKey, identity, ids, regionKey, Collections.emptySet());
+        proximity(matchingKey, identity, ids, "", Collections.emptySet());
     }
 
     public synchronized void proximity(
             String matchingKey,
             String identity,
             Set<Long> ids,
-            String regionKey,
+            String worldKey,
             Set<String> fingerprints) {
         if (!matchingKey.equals(salt)) {
             return; // A key update raced local matching; retry with the new key next tick.
@@ -768,8 +732,11 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         if (!identity.isEmpty() && !identity.matches("[0-9a-f]{64}")) {
             throw new IllegalArgumentException("Invalid voice token");
         }
-        if (!regionKey.isEmpty() && !regionKey.matches("[0-9a-f]{64}")) {
-            throw new IllegalArgumentException("Invalid proximity region");
+        if (!worldKey.isEmpty() && !worldKey.matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException("Invalid world key");
+        }
+        if (ids.size() > MAX_SEEN) {
+            throw new IllegalArgumentException("Too many nearby peers");
         }
         if (fingerprints.size() > MAX_SEEN
                 || !fingerprints.stream().allMatch(f -> f.matches("[0-9a-f]{5}"))) {
@@ -777,7 +744,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         }
         token = identity;
         proximitySuspended = false;
-        region = identity.isEmpty() ? "" : regionKey;
+        world = identity.isEmpty() ? "" : worldKey;
         active = !identity.isEmpty();
         activityAt = System.nanoTime();
         nearby = active ? new HashSet<>(ids) : Collections.emptySet();
@@ -802,7 +769,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
 
     /** Keep established room audio alive without claiming an old map position is current. */
     public synchronized boolean suspendProximity(String matchingKey, String identity) {
-        boolean changed = !proximitySuspended || !region.isEmpty() || !nearby.isEmpty();
+        boolean changed = !proximitySuspended || !world.isEmpty() || !nearby.isEmpty();
         // The client may refresh its established identity without reading a loading scene.
         // Never publish an old token under a new matching-key epoch.
         if (matchingKey.equals(salt)) {
@@ -815,7 +782,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             refreshingKey = false;
         }
         proximitySuspended = true;
-        region = "";
+        world = "";
         nearby = Collections.emptySet();
         seen = Collections.emptySet();
         active = inRoom() && !token.isEmpty();
@@ -853,7 +820,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     }
 
     void sendPeerStatus(long now) {
-        if (!peerStatusDirty || !peerStatusSupported || (peerStatusSentAt != 0 && now - peerStatusSentAt < 5_000_000_000L)) {
+        if (!peerStatusDirty || (peerStatusSentAt != 0 && now - peerStatusSentAt < 5_000_000_000L)) {
             return;
         }
         String message = "{\"type\":\"status\",\"muted\":" + selfMuted + ",\"deaf\":" + selfDeaf + "}";
@@ -913,12 +880,8 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         msg.addProperty("type", "state");
         msg.addProperty("token", proximitySuspended && !inRoom() ? "" : token);
         boolean exclusive = requiredRoom != null || !restoringRoom.isEmpty() || failedRoomRecovery;
-        if (proximityRoomsSupported) {
-            msg.addProperty("region", exclusive ? "" : region);
-        }
-        if (keyEpoch != 0) {
-            msg.addProperty("keyEpoch", keyEpoch);
-        }
+        msg.addProperty("world", exclusive ? "" : world);
+        msg.addProperty("keyEpoch", keyEpoch);
         msg.addProperty("deaf", deaf || !scopeAllowed());
         JsonArray list = new JsonArray();
         for (long id : new java.util.TreeSet<>(blocked)) {
@@ -927,7 +890,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         msg.add("blocked", list);
         Set<Long> near = exclusive ? Collections.emptySet() : new java.util.TreeSet<>(nearby);
         Set<String> sightings =
-                !exclusive && !region.isEmpty() && !(proximitySuspended && !inRoom())
+                !exclusive && !world.isEmpty()
                         ? new java.util.TreeSet<>(seen)
                         : Collections.emptySet();
         String text = gson.toJson(msg);
@@ -1020,9 +983,9 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         log.debug(
                 "RSVC relay closing: code={}, category={}",
                 code,
-                DisconnectReason.fromClose(code, reason));
+                DisconnectReason.fromClose(code));
         webSocket.close(code, null);
-        DisconnectReason category = DisconnectReason.fromClose(code, reason);
+        DisconnectReason category = DisconnectReason.fromClose(code);
         fail(
                 category == DisconnectReason.SERVER_FULL
                         ? "Voice server full"
@@ -1057,8 +1020,8 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         log.debug(
                 "RSVC relay closed: code={}, category={}",
                 code,
-                DisconnectReason.fromClose(code, reason));
-        DisconnectReason category = DisconnectReason.fromClose(code, reason);
+                DisconnectReason.fromClose(code));
+        DisconnectReason category = DisconnectReason.fromClose(code);
         fail(
                 category == DisconnectReason.SERVER_FULL ? "Voice server full" : "Disconnected",
                 category);
