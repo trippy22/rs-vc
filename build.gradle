@@ -12,10 +12,11 @@ repositories {
     mavenCentral()
 }
 
-def runeLiteVersion = 'latest.release'
+def runeLiteVersion = providers.gradleProperty('runeLiteVersion').getOrElse('latest.release')
 dependencies {
     compileOnly "net.runelite:client:${runeLiteVersion}"
     testImplementation "net.runelite:client:${runeLiteVersion}"
+    testImplementation "net.runelite:jshell:${runeLiteVersion}"
     testImplementation 'junit:junit:4.13.2'
 }
 
