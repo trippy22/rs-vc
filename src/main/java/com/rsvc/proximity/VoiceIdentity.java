@@ -3,6 +3,7 @@ package com.rsvc.proximity;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.util.Locale;
+import java.util.regex.Pattern;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -11,6 +12,9 @@ import javax.crypto.spec.SecretKeySpec;
  * Matching only: names and worlds never leave this helper in plaintext. Not account authentication.
  */
 public final class VoiceIdentity {
+    private static final Pattern SALT = Pattern.compile("[0-9a-f]{64}");
+    private static final Pattern NAME = Pattern.compile("[a-z0-9 -]{1,12}");
+
     private VoiceIdentity() {}
 
     public static String normalize(String name) {
@@ -19,14 +23,14 @@ public final class VoiceIdentity {
 
     public static String token(String salt, String name, int world) {
         if (salt == null
-                || !salt.matches("[0-9a-f]{64}")
+                || !SALT.matcher(salt).matches()
                 || name == null
                 || world < 1
                 || world > 65535) {
             throw new IllegalArgumentException("Invalid matching context");
         }
         String normalized = normalize(name);
-        if (!normalized.matches("[a-z0-9 -]{1,12}")) {
+        if (!NAME.matcher(normalized).matches()) {
             throw new IllegalArgumentException("Character name unavailable");
         }
         return digest(salt, "rs-vc-4\n" + world + "\n" + normalized);
@@ -37,7 +41,7 @@ public final class VoiceIdentity {
      * carries no map location, so region borders never separate nearby players.
      */
     public static String worldKey(String salt, int world) {
-        if (salt == null || !salt.matches("[0-9a-f]{64}") || world < 1 || world > 65535) {
+        if (salt == null || !SALT.matcher(salt).matches() || world < 1 || world > 65535) {
             throw new IllegalArgumentException("Invalid proximity context");
         }
         return digest(salt, "rs-vc-world-1\n" + world);

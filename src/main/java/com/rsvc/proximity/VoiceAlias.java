@@ -1,10 +1,13 @@
 package com.rsvc.proximity;
 
 import java.security.SecureRandom;
+import java.util.regex.Pattern;
 
 /** Random per-join label, with no input from the RuneScape account or character. */
 public final class VoiceAlias {
     private static final SecureRandom RANDOM = new SecureRandom();
+    // Compiled once: every roster entry is checked.
+    private static final Pattern ALIAS = Pattern.compile("VC-[0-9a-f]{8}");
 
     private VoiceAlias() {}
 
@@ -13,7 +16,7 @@ public final class VoiceAlias {
     }
 
     public static boolean valid(String alias) {
-        return alias != null && alias.matches("VC-[0-9a-f]{8}");
+        return alias != null && ALIAS.matcher(alias).matches();
     }
 
     public static String replacement(String previous) {

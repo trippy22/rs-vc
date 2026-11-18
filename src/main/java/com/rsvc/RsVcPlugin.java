@@ -971,6 +971,8 @@ public class RsVcPlugin extends Plugin implements KeyListener {
         WorldPoint origin = self.getWorldLocation();
         Map<String, Player> namedPlayers = new HashMap<>();
         List<Player> inRange = new ArrayList<>();
+        // Chebyshev distance of each in-range player, read once for the sort below.
+        Map<Player, Integer> distances = new HashMap<>();
         for (Player player : visiblePlayers) {
             if (player == self || player.getName() == null || player.getWorldView() != view) {
                 continue;
@@ -989,6 +991,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
                     true)) {
                 namedPlayers.put(player.getName(), player);
                 inRange.add(player);
+                distances.put(player, point.distanceTo(origin));
             } else if (current.inRoom()) {
                 // A room member may be visible outside the ordinary proximity radius.
                 namedPlayers.put(player.getName(), player);
@@ -1001,7 +1004,7 @@ public class RsVcPlugin extends Plugin implements KeyListener {
             matchedPlayers.clear();
             matches.forEach((name, id) -> matchedPlayers.put(id, namedPlayers.get(name)));
             // Nearest first, so a crowd beyond either cap keeps the closest characters.
-            inRange.sort(Comparator.comparingInt(p -> p.getWorldLocation().distanceTo(origin)));
+            inRange.sort(Comparator.comparingInt(distances::get));
             // Every confirmed peer in range; the relay decides who shares audio.
             Set<Long> nearby = new HashSet<>();
             List<String> names = new ArrayList<>();
