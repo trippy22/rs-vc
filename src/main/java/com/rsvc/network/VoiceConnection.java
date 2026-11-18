@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.regex.Pattern;
 
 /**
  * WebSocket protocol and routing state. Synchronized entry points serialize OkHttp callbacks with
@@ -38,6 +39,9 @@ import java.util.function.Consumer;
  */
 public final class VoiceConnection extends WebSocketListener implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(VoiceConnection.class);
+    // Compiled once: proximity() checks these every game tick.
+    private static final Pattern HEX_64 = Pattern.compile("[0-9a-f]{64}");
+    private static final Pattern FINGERPRINT = Pattern.compile("[0-9a-f]{5}");
     public static final class Peer {
         public final long id;
         public final String name;
@@ -84,6 +88,8 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
     private long keyEpoch;
     private boolean refreshingKey;
     private boolean roomPending;
+    // The relay offered short invite codes in welcome; older relays reject the request.
+    private boolean shortCodes;
     private String world = "";
     private boolean selfMuted, selfDeaf;
     private boolean peerStatusDirty = true;
@@ -189,7 +195,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         }
         restoringRoom = recoveryRoom;
         failedRoomRecovery = false;
-        requestRoom("join", recoveryRoom, true);
+        requestRoom("join", recoveryRoom, true, false);
         return true;
     }
 
@@ -207,11 +213,20 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         return protocol != 0 && activeConnection() && !roomPending;
     }
 
+    /** Creates a long code, which every plugin release accepts; party voice depends on that. */
     public synchronized void room(String action, String code) {
-        requestRoom(action, code, false);
+        requestRoom(action, code, false, false);
     }
 
-    private void requestRoom(String action, String code, boolean automatic) {
+    /**
+     * A room request from the person at the keyboard: create asks for a short code they can
+     * read out, when the relay offers them. Members need a plugin release that knows short codes.
+     */
+    public synchronized void shareableRoom(String action, String code) {
+        requestRoom(action, code, false, true);
+    }
+
+    private void requestRoom(String action, String code, boolean automatic, boolean shareable) {
         if (!roomsAvailable()) {
             if (!automatic) {
                 status.accept("Voice isn't connected yet — try the room again");
@@ -221,10 +236,9 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         if (!action.equals("create") && !action.equals("join") && !action.equals("leave")) {
             throw new IllegalArgumentException();
         }
-        String normalized =
-                code.replace("-", "").replace(" ", "").toLowerCase(java.util.Locale.ROOT);
-        if (action.equals("join") && !normalized.matches("[0-9a-f]{24}")) {
-            status.accept("Enter a valid 24-character invite code");
+        String normalized = RoomCode.normalize(code);
+        if (action.equals("join") && normalized == null) {
+            status.accept("That isn't a valid invite code — check it and try again");
             return;
         }
         JsonObject msg = new JsonObject();
@@ -232,6 +246,8 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         msg.addProperty("action", action);
         if (action.equals("join")) {
             msg.addProperty("code", normalized);
+        } else if (action.equals("create") && shareable && shortCodes) {
+            msg.addProperty("format", "short");
         }
         roomPending = true;
         if (!automatic) {
@@ -482,9 +498,11 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             if ("welcome".equals(type)) {
                 int version = (int) ControlJson.number(msg, "v", 9, 9);
                 String key = msg.get("salt").getAsString();
-                if (!key.matches("[0-9a-f]{64}") || !salt.isEmpty()) {
+                if (!HEX_64.matcher(key).matches() || !salt.isEmpty()) {
                     throw new IllegalArgumentException();
                 }
+                // Optional: relays that predate short codes leave it out.
+                shortCodes = optionalBoolean(msg, "shortCodes");
                 keyEpoch = ControlJson.number(msg, "keyEpoch", 1, 9007199254740991L);
                 selfId = ControlJson.number(msg, "id", 1, 0xffffffffL);
                 long frame = ControlJson.number(msg, "frameMs", 20, 40);
@@ -511,7 +529,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
                 long epoch =
                         ControlJson.number(msg, "keyEpoch", keyEpoch + 1, 9007199254740991L);
                 String key = msg.get("salt").getAsString();
-                if (!key.matches("[0-9a-f]{64}") || key.equals(salt)) {
+                if (!HEX_64.matcher(key).matches() || key.equals(salt)) {
                     throw new IllegalArgumentException();
                 }
                 keyEpoch = epoch;
@@ -524,7 +542,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             if ("room".equals(type)) {
                 String code = msg.get("code").getAsString(),
                         reason = msg.get("reason").getAsString();
-                if ((!code.isEmpty() && !code.matches("[0-9a-f]{24}"))
+                if ((!code.isEmpty() && !RoomCode.valid(code))
                         || !java.util.Arrays.asList(
                                         "created",
                                         "joined",
@@ -714,7 +732,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         }
     }
 
-    /** Called only with locally matched consenting voice IDs, never arbitrary player hashes. */
+    /** IDs are locally confirmed voice users only; this overload reports no sightings. */
     public synchronized void proximity(String matchingKey, String identity, Set<Long> ids) {
         proximity(matchingKey, identity, ids, "", Collections.emptySet());
     }
@@ -729,18 +747,22 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
             return; // A key update raced local matching; retry with the new key next tick.
         }
         refreshingKey = false;
-        if (!identity.isEmpty() && !identity.matches("[0-9a-f]{64}")) {
+        if (!identity.isEmpty() && !HEX_64.matcher(identity).matches()) {
             throw new IllegalArgumentException("Invalid voice token");
         }
-        if (!worldKey.isEmpty() && !worldKey.matches("[0-9a-f]{64}")) {
+        if (!worldKey.isEmpty() && !HEX_64.matcher(worldKey).matches()) {
             throw new IllegalArgumentException("Invalid world key");
         }
         if (ids.size() > MAX_SEEN) {
             throw new IllegalArgumentException("Too many nearby peers");
         }
-        if (fingerprints.size() > MAX_SEEN
-                || !fingerprints.stream().allMatch(f -> f.matches("[0-9a-f]{5}"))) {
+        if (fingerprints.size() > MAX_SEEN) {
             throw new IllegalArgumentException("Invalid sightings");
+        }
+        for (String fingerprint : fingerprints) {
+            if (!FINGERPRINT.matcher(fingerprint).matches()) {
+                throw new IllegalArgumentException("Invalid sightings");
+            }
         }
         token = identity;
         proximitySuspended = false;
@@ -763,7 +785,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         if (!resumeRoom.isEmpty() && roomsAvailable()) {
             String code = resumeRoom;
             resumeRoom = "";
-            requestRoom("join", code, true);
+            requestRoom("join", code, true, false);
         }
     }
 
@@ -774,7 +796,7 @@ public final class VoiceConnection extends WebSocketListener implements AutoClos
         // Never publish an old token under a new matching-key epoch.
         if (matchingKey.equals(salt)) {
             if (!identity.equals(token) && !identity.isEmpty()
-                    && !identity.matches("[0-9a-f]{64}")) {
+                    && !HEX_64.matcher(identity).matches()) {
                 throw new IllegalArgumentException("Invalid voice token");
             }
             changed |= !identity.equals(token) || refreshingKey;

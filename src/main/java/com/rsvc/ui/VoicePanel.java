@@ -488,7 +488,7 @@ public final class VoicePanel extends PluginPanel {
         if (roomCode.isEmpty()) {
             return;
         }
-        javax.swing.JTextField invite = new javax.swing.JTextField(roomCode);
+        javax.swing.JTextField invite = new javax.swing.JTextField(com.rsvc.network.RoomCode.display(roomCode));
         invite.setEditable(false);
         SwingUtilities.invokeLater(
                 () -> {

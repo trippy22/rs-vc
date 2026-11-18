@@ -185,7 +185,7 @@ public final class VoiceClient {
 
     public void requestRoom(String action, String code) {
         if (connection != null) {
-            connection.room(action, code);
+            connection.shareableRoom(action, code);
             recoveryPaused = connection.roomRecoveryPaused();
         }
     }

@@ -27,6 +27,7 @@ When alone, your mic indicator can still react, but no audio is uploaded.
 
 Open **Room** to **Create** a room and share its code, or **Join** with a code.
 Use **Share code** to copy it again and **Leave room** to return to nearby voice.
+Codes look like `ABCD-EFGH`; type them with or without the dash, in any case.
 
 Rooms replace nearby voice and work across distances, worlds and floors while
 you're logged in. Keep codes private: anyone with a valid code can join. Rooms

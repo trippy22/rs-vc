@@ -1,5 +1,7 @@
 package com.rsvc.party;
 
+import com.rsvc.network.RoomCode;
+
 import net.runelite.client.party.messages.PartyMemberMessage;
 
 /** Small control message carried by RuneLite; audio and party passphrases never go here. */
@@ -24,7 +26,7 @@ public final class RsVcPartyVoice extends PartyMemberMessage {
                 && partyId == party
                 && localRelay == local
                 && room != null
-                && (room.isEmpty() || room.matches("[0-9a-f]{24}"));
+                && (room.isEmpty() || RoomCode.isLong(room));
     }
 
     public boolean participating() {
